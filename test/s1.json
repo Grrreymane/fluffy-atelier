@@ -1,0 +1,6 @@
+[
+ {"_label":"fox girl","species":"fox","body":"girl","pose":"stand","fur":{"main":"#f08a3a","sub":"#fff6ec","acc":"#3b2833","inner":"#fff1e2","nose":"#3b2833"},"eyes":{"style":"sparkle","color":"#3a9cf5"},"expr":"smile","hair":{"id":"tuft","color":"#f6a24e"},"wear":{}},
+ {"_label":"bunny","species":"bunny","body":"girl","pose":"wave","fur":{"main":"#fbf7f3","sub":"#ffffff","acc":"#ffb3c6","inner":"#ffc4d6","nose":"#ff8fab"},"eyes":{"style":"round","color":"#e2577f"},"expr":"grin","hair":{"id":"bob","color":"#fff0e4"},"wear":{}},
+ {"_label":"wolf boy","species":"wolf","body":"boy","pose":"hips","fur":{"main":"#8e98a9","sub":"#eef1f6","acc":"#4b5263","inner":"#e6e9f0","nose":"#2c2f3a"},"eyes":{"style":"boy","color":"#f2b632"},"expr":"cool","hair":{"id":"ivy","color":"#aab3c2"},"wear":{}},
+ {"_label":"bear chub","species":"bear","body":"chub","pose":"cheer","fur":{"main":"#a46f4b","sub":"#f1dcc3","acc":"#6b4630","inner":"#d9ab88","nose":"#3a2620"},"eyes":{"style":"happy","color":"#3a2620"},"expr":"grin","hair":{"id":"none","color":"#b88560"},"wear":{}}
+]

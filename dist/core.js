@@ -1,0 +1,4265 @@
+/* ---- util.js ---- */
+/* ===== util.js — geometry, color and SVG helpers (pure, no DOM) ===== */
+const CX = 200;
+const r1 = n => Math.round(n * 10) / 10;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+
+/* ---------- color ---------- */
+function hex2rgb(h) {
+  h = String(h).replace('#', '');
+  if (h.length === 3) h = h.split('').map(c => c + c).join('');
+  const n = parseInt(h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+function rgb2hex(r, g, b) {
+  return '#' + [r, g, b].map(v => clamp(Math.round(v), 0, 255).toString(16).padStart(2, '0')).join('');
+}
+function rgb2hsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  let h = 0, s = 0; const l = (mx + mn) / 2;
+  if (mx !== mn) {
+    const d = mx - mn;
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    if (mx === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return [h, s, l];
+}
+function hsl2rgb(h, s, l) {
+  h = ((h % 360) + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; } else if (h < 120) { r = x; g = c; } else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; } else if (h < 300) { r = x; b = c; } else { r = c; b = x; }
+  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+}
+const toHsl = hex => rgb2hsl(...hex2rgb(hex));
+const fromHsl = (h, s, l) => rgb2hex(...hsl2rgb(h, clamp(s, 0, 1), clamp(l, 0, 1)));
+/* change lightness while keeping chroma (avoids pale colors turning neon when darkened) */
+function withL(hex, l2, hueShift = 0, satMul = 1) {
+  const [h, s, l] = toHsl(hex);
+  const c = s * (1 - Math.abs(2 * l - 1)) * satMul;
+  l2 = clamp(l2, 0, 1);
+  const den = 1 - Math.abs(2 * l2 - 1);
+  return fromHsl(h + hueShift, den > 0.001 ? clamp(c / den, 0, 1) : 0, l2);
+}
+function lighten(hex, a) { const l = toHsl(hex)[2]; return withL(hex, l + (1 - l) * a); }
+function darken(hex, a) { const l = toHsl(hex)[2]; return withL(hex, l * (1 - a)); }
+function mix(a, b, t) {
+  const A = hex2rgb(a), B = hex2rgb(b);
+  return rgb2hex(A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t);
+}
+/* a colour multiplied by another (正片叠底) */
+function multiplyHex(a, b) { const A = hex2rgb(a), B = hex2rgb(b); return rgb2hex(A[0] * B[0] / 255, A[1] * B[1] / 255, A[2] * B[2] / 255); }
+function hueToward(h, target, k) { const dh = ((target - h + 540) % 360) - 180; return h + dh * k; }
+/* cartoon outline: darker, slightly purple-shifted; pale colors get a soft muted line */
+const INK_LINE = '#3b1a1f';
+function lineOf(hex) {
+  const [h, s, l] = toHsl(hex);
+  const chroma = s * (1 - Math.abs(2 * l - 1));
+  const l2 = l > 0.8 ? 0.58 - (l - 0.8) * 0.3 : l * 0.46;
+  const s2 = clamp(chroma * 1.25 + 0.14, 0, 0.88);
+  return mix(fromHsl(hueToward(h, 285, chroma < 0.15 ? 0.6 : 0.18), s2, Math.max(0.08, l2)), INK_LINE, .8);
+}
+/* soft shadow tone */
+function shadeOf(hex, k = 0.18) {
+  const [h, s, l] = toHsl(hex);
+  return withL(hex, l * (1 - k), hueToward(h, 280, 0.1) - h, 1.08);
+}
+const isLight = hex => toHsl(hex)[2] > 0.62;
+
+/* ---------- points & paths ---------- */
+const pt = a => Array.isArray(a) ? { x: a[0], y: a[1], c: !!a[2] } : a;
+const mirX = x => 2 * CX - x;
+const mirPt = p => ({ x: mirX(p.x), y: p.y, c: p.c });
+function same(a, b) { return Math.abs(a.x - b.x) < 0.05 && Math.abs(a.y - b.y) < 0.05; }
+
+/* Mirror a right-half contour (top -> right side -> bottom) into a full loop */
+function sym(right) {
+  const R = right.map(pt);
+  const L = R.slice().reverse().map(mirPt);
+  const out = R.slice();
+  for (const q of L) if (!same(q, out[out.length - 1])) out.push(q);
+  if (out.length > 2 && same(out[0], out[out.length - 1])) out.pop();
+  return out;
+}
+/* Catmull-Rom -> cubic Bezier. Points flagged c=true are sharp corners. */
+function smooth(points, closed = true, t = 1) {
+  const P = points.map(pt), n = P.length;
+  if (n < 2) return '';
+  const get = i => closed ? P[(i + n) % n] : P[clamp(i, 0, n - 1)];
+  let d = `M${r1(P[0].x)},${r1(P[0].y)}`;
+  const segs = closed ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    const p1 = get(i), p2 = get(i + 1);
+    const a = (p1.c || (!closed && i === 0)) ? p1 : get(i - 1);
+    const b = (p2.c || (!closed && i + 1 === n - 1)) ? p2 : get(i + 2);
+    const c1x = p1.x + (p2.x - a.x) / 6 * t, c1y = p1.y + (p2.y - a.y) / 6 * t;
+    const c2x = p2.x - (b.x - p1.x) / 6 * t, c2y = p2.y - (b.y - p1.y) / 6 * t;
+    d += `C${r1(c1x)},${r1(c1y)} ${r1(c2x)},${r1(c2y)} ${r1(p2.x)},${r1(p2.y)}`;
+  }
+  return closed ? d + 'Z' : d;
+}
+const S = (right, t) => smooth(sym(right), true, t);         // symmetric closed shape
+const poly = pts => 'M' + pts.map(p => { p = pt(p); return r1(p.x) + ',' + r1(p.y); }).join('L');
+/* mirror / rotate a list of points */
+const mirAll = pts => pts.map(p => mirPt(pt(p)));
+function rot(pts, ang, ox = 0, oy = 0) {
+  const c = Math.cos(ang), s = Math.sin(ang);
+  return pts.map(p => { p = pt(p); const x = p.x - ox, y = p.y - oy; return { x: ox + x * c - y * s, y: oy + x * s + y * c, c: p.c }; });
+}
+
+/* ---------- spine sampling (for limbs, tails, hair strands) ---------- */
+function bez(p0, p1, p2, p3, t) {
+  const u = 1 - t;
+  return { x: u * u * u * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * p3.x,
+           y: u * u * u * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y + t * t * t * p3.y };
+}
+/* sample a polyline with rounded joints into evenly spaced points */
+function samplePolyline(pts, step = 7, round = 14) {
+  const P = pts.map(pt);
+  let path = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const a = P[i - 1], b = P[i];
+    if (i < P.length - 1) {
+      const c = P[i + 1];
+      const l1 = Math.hypot(b.x - a.x, b.y - a.y), l2 = Math.hypot(c.x - b.x, c.y - b.y);
+      const r = Math.min(round, l1 / 3, l2 / 3);
+      const pA = { x: b.x - (b.x - a.x) / l1 * r, y: b.y - (b.y - a.y) / l1 * r };
+      const pB = { x: b.x + (c.x - b.x) / l2 * r, y: b.y + (c.y - b.y) / l2 * r };
+      path.push(pA);
+      for (let k = 1; k < 6; k++) {
+        const t = k / 6, u = 1 - t;
+        path.push({ x: u * u * pA.x + 2 * u * t * b.x + t * t * pB.x, y: u * u * pA.y + 2 * u * t * b.y + t * t * pB.y });
+      }
+      path.push(pB);
+    } else path.push(b);
+  }
+  // resample by arc length
+  const cum = [0];
+  for (let i = 1; i < path.length; i++) cum.push(cum[i - 1] + Math.hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y));
+  const L = cum[cum.length - 1];
+  const n = Math.max(2, Math.ceil(L / step));
+  const out = [];
+  let j = 1;
+  for (let k = 0; k <= n; k++) {
+    const s = L * k / n;
+    while (j < cum.length - 1 && cum[j] < s) j++;
+    const t = (s - cum[j - 1]) / ((cum[j] - cum[j - 1]) || 1);
+    out.push({ x: lerp(path[j - 1].x, path[j].x, t), y: lerp(path[j - 1].y, path[j].y, t), s });
+  }
+  out.L = L;
+  return out;
+}
+function sampleBezier(p0, p1, p2, p3, n = 24) {
+  const raw = [];
+  for (let i = 0; i <= 80; i++) raw.push(bez(pt(p0), pt(p1), pt(p2), pt(p3), i / 80));
+  return resample(raw, n);
+}
+function resample(raw, n) {
+  const cum = [0];
+  for (let i = 1; i < raw.length; i++) cum.push(cum[i - 1] + Math.hypot(raw[i].x - raw[i - 1].x, raw[i].y - raw[i - 1].y));
+  const L = cum[cum.length - 1], out = [];
+  let j = 1;
+  for (let k = 0; k <= n; k++) {
+    const s = L * k / n;
+    while (j < cum.length - 1 && cum[j] < s) j++;
+    const t = (s - cum[j - 1]) / ((cum[j] - cum[j - 1]) || 1);
+    out.push({ x: lerp(raw[j - 1].x, raw[j].x, t), y: lerp(raw[j - 1].y, raw[j].y, t), s });
+  }
+  out.L = L;
+  return out;
+}
+/* normals for a sampled spine */
+function normals(sp) {
+  return sp.map((p, i) => {
+    const a = sp[Math.max(0, i - 1)], b = sp[Math.min(sp.length - 1, i + 1)];
+    const dx = b.x - a.x, dy = b.y - a.y, l = Math.hypot(dx, dy) || 1;
+    return { x: -dy / l, y: dx / l, tx: dx / l, ty: dy / l };
+  });
+}
+/* segment intersection (proper crossing only) */
+function segX(a, b, c, d) {
+  const rx = b.x - a.x, ry = b.y - a.y, sx = d.x - c.x, sy = d.y - c.y;
+  const den = rx * sy - ry * sx;
+  if (Math.abs(den) < 1e-9) return null;
+  const t = ((c.x - a.x) * sy - (c.y - a.y) * sx) / den, u = ((c.x - a.x) * ry - (c.y - a.y) * rx) / den;
+  return t > 1e-6 && t < 1 - 1e-6 && u > 1e-6 && u < 1 - 1e-6 ? { x: a.x + t * rx, y: a.y + t * ry } : null;
+}
+/* cut the little loops an offset curve makes on the inside of a tight bend; the crossing becomes a sharp crease */
+function deloop(P, win = 40) {
+  const out = P.slice();
+  for (let i = 0; i < out.length - 3; i++) {
+    for (let j = Math.min(out.length - 2, i + win); j > i + 1; j--) {
+      const X = segX(out[i], out[i + 1], out[j], out[j + 1]);
+      if (X) { out.splice(i + 1, j - i, { x: X.x, y: X.y, c: true }); break; }
+    }
+  }
+  return out;
+}
+/* Thick tube around a sampled spine. width(t) gives half-width for t in [0,1].
+   caps: 'round' | 'flat'. fuzz(i,t) -> [addLeft, addRight] makes fluffy spikes (marked as corners). */
+function tubePts(sp, width, capStart = 'round', capEnd = 'round', fuzz = null) {
+  const N = normals(sp), n = sp.length;
+  const left = [], right = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    const w = width(t);
+    let fl = 0, fr = 0;
+    if (fuzz) { const f = fuzz(i, t); fl = f[0]; fr = f[1]; }
+    left.push({ x: sp[i].x + N[i].x * (w + fl), y: sp[i].y + N[i].y * (w + fl), c: fl > 0 });
+    right.push({ x: sp[i].x - N[i].x * (w + fr), y: sp[i].y - N[i].y * (w + fr), c: fr > 0 });
+  }
+  const cap = (p, nn, w, dir) => {
+    const out = [];
+    for (let k = 1; k < 6; k++) {
+      const a = Math.PI * k / 6, ca = Math.cos(a), sa = Math.sin(a);
+      out.push({ x: p.x + nn.x * w * ca + nn.tx * dir * w * sa, y: p.y + nn.y * w * ca + nn.ty * dir * w * sa });
+    }
+    return out;
+  };
+  if (capStart === 'flat') { left[0].c = true; right[0].c = true; }
+  if (capEnd === 'flat') { left[n - 1].c = true; right[n - 1].c = true; }
+  const L2 = deloop(left), R2 = deloop(right);
+  left.length = 0; left.push(...L2); right.length = 0; right.push(...R2);
+  const endCap = capEnd === 'round' ? cap(sp[n - 1], N[n - 1], width(1), 1) : [];
+  const nn = N[0];
+  const startCap = capStart === 'round' ? cap(sp[0], { x: -nn.x, y: -nn.y, tx: nn.tx, ty: nn.ty }, width(0), -1) : [];
+  return { body: [...left, ...endCap, ...right.slice().reverse()], start: startCap };
+}
+function tube(sp, width, capStart = 'round', capEnd = 'round', fuzz = null) {
+  const t = tubePts(sp, width, capStart, capEnd, fuzz);
+  return smooth([...t.body, ...t.start], true);
+}
+/* open outline of a tube (no line across the flat start) */
+function tubeOpen(sp, width, capEnd = 'round') {
+  return smooth(tubePts(sp, width, 'flat', capEnd).body, false);
+}
+
+
+/* 2-bone IK. bend: +1 / -1 picks elbow side. Returns elbow & (clamped) wrist */
+function ik(S0, T, L1, L2, bend) {
+  const dx = T.x - S0.x, dy = T.y - S0.y;
+  let d = Math.hypot(dx, dy);
+  d = clamp(d, Math.abs(L1 - L2) + 0.5, L1 + L2 - 0.5);
+  const a = Math.atan2(dy, dx);
+  const A = Math.acos(clamp((L1 * L1 + d * d - L2 * L2) / (2 * L1 * d), -1, 1));
+  const ang = a + bend * A;
+  return { E: { x: S0.x + Math.cos(ang) * L1, y: S0.y + Math.sin(ang) * L1 }, W: { x: S0.x + Math.cos(a) * d, y: S0.y + Math.sin(a) * d } };
+}
+/* sub-polyline from start up to arc length s */
+function cutPolyline(pts, s) {
+  const out = [pts[0]];
+  let acc = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i], l = Math.hypot(b.x - a.x, b.y - a.y);
+    if (acc + l >= s) { const t = (s - acc) / l; out.push({ x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) }); return out; }
+    acc += l; out.push(b);
+  }
+  return out;
+}
+const plen = pts => { let L = 0; for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y); return L; };
+
+/* ---------- SVG snippets ---------- */
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const attrs = o => Object.entries(o).filter(([, v]) => v !== undefined && v !== null && v !== false).map(([k, v]) => `${k}="${v}"`).join(' ');
+const path = (d, o = {}) => `<path d="${d}" ${attrs(o)}/>`;
+const circ = (x, y, r, o = {}) => `<circle cx="${r1(x)}" cy="${r1(y)}" r="${r1(r)}" ${attrs(o)}/>`;
+const ell = (x, y, rx, ry, o = {}) => `<ellipse cx="${r1(x)}" cy="${r1(y)}" rx="${r1(rx)}" ry="${r1(ry)}" ${attrs(o)}/>`;
+const g = (inner, o = {}) => `<g ${attrs(o)}>${inner}</g>`;
+/* line-art stroke */
+const ln = (d, col, w = 2, o = {}) => path(d, { fill: 'none', stroke: col, 'stroke-width': w, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', ...o });
+/* stitch line (dashed) */
+const stitch = (d, col, w = 1.4, o = {}) => path(d, { fill: 'none', stroke: col, 'stroke-width': w, 'stroke-dasharray': '3.2 2.6', 'stroke-linecap': 'round', ...o });
+
+/* deterministic pseudo random (for sparkles etc.) */
+function rng(seed) { let s = seed >>> 0 || 1; return () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296; }
+
+/* ---- defs.js ---- */
+/* ===== defs.js — render context, paint helper, fabric patterns ===== */
+function makeCtx(id) {
+  const defs = new Map();
+  let uid = 0;
+  const ctx = {
+    id,
+    def(key, markup) { if (!defs.has(key)) defs.set(key, markup.replace(/__ID__/g, `${id}-${key}`)); return `${id}-${key}`; },
+    url(key) { return `url(#${id}-${key})`; },
+    next(p = 'u') { return `${id}-${p}${++uid}`; },
+    defsMarkup() { return [...defs.values()].join(''); },
+    /* register a path in defs and return its id, so it can be reused by <use> */
+    shape(d) { const k = ctx.next('s'); defs.set(k, `<path id="${k}" d="${d}"/>`); return k; },
+    clip(d) { const k = ctx.next('c'); defs.set(k, `<clipPath id="${k}"><path d="${d}"/></clipPath>`); return `url(#${k})`; },
+    /* union of several paths as one clip region */
+    clipAll(ds) { const k = ctx.next('c'); defs.set(k, `<clipPath id="${k}">${ds.map(d => `<path d="${d}"/>`).join('')}</clipPath>`); return `url(#${k})`; },
+    clipUse(shapeId) { const k = ctx.next('c'); defs.set(k, `<clipPath id="${k}"><use href="#${shapeId}"/></clipPath>`); return `url(#${k})`; },
+    shade(kind = 'lr') {
+      const G = {
+        lr: `<linearGradient id="__ID__" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="${SHADOW_TINT}" stop-opacity="0"/><stop offset=".78" stop-color="${SHADOW_TINT}" stop-opacity="0"/><stop offset=".78" stop-color="${SHADOW_TINT}" stop-opacity="${shadowAt(.12)}"/><stop offset="1" stop-color="${SHADOW_TINT}" stop-opacity="${shadowAt(.12)}"/></linearGradient>`,
+        tb: `<linearGradient id="__ID__" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="${SHADOW_TINT}" stop-opacity="0"/><stop offset=".74" stop-color="${SHADOW_TINT}" stop-opacity="0"/><stop offset=".74" stop-color="${SHADOW_TINT}" stop-opacity="${shadowAt(.14)}"/><stop offset="1" stop-color="${SHADOW_TINT}" stop-opacity="${shadowAt(.14)}"/></linearGradient>`,
+        rad: `<radialGradient id="__ID__" cx=".4" cy=".34" r=".78"><stop offset="0" stop-color="${SHADOW_TINT}" stop-opacity="0"/><stop offset=".86" stop-color="${SHADOW_TINT}" stop-opacity="0"/><stop offset=".86" stop-color="${SHADOW_TINT}" stop-opacity="${shadowAt(.12)}"/><stop offset="1" stop-color="${SHADOW_TINT}" stop-opacity="${shadowAt(.12)}"/></radialGradient>`,
+        skirt: `<linearGradient id="__ID__" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="${SHADOW_TINT}" stop-opacity="0"/><stop offset=".72" stop-color="${SHADOW_TINT}" stop-opacity="0"/><stop offset=".72" stop-color="${SHADOW_TINT}" stop-opacity="${shadowAt(.15)}"/><stop offset="1" stop-color="${SHADOW_TINT}" stop-opacity="${shadowAt(.15)}"/></linearGradient>`,
+        gloss: `<linearGradient id="__ID__" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".5"/><stop offset=".5" stop-color="#fff" stop-opacity="0"/></linearGradient>`,
+      };
+      ctx.def('g-' + kind, G[kind]);
+      return ctx.url('g-' + kind);
+    },
+    pattern(type, col, base) {
+      if (!type || type === 'none') return null;
+      const key = `p-${type}-${col.replace('#', '')}-${(base || '').replace('#', '')}`;
+      ctx.def(key, patternMarkup(type, col, base));
+      return ctx.url(key);
+    },
+  };
+  return ctx;
+}
+const use = (sid, o = {}) => `<use href="#${sid}" ${attrs(o)}/>`;
+
+/* paint a garment shape: fill + optional pattern + shading + outline */
+/* set by renderCharacter while a sleeved garment draws itself (see armholeMasks) */
+let PAINT_MASK = null;
+function paint(ctx, d, fill, o = {}) {
+  const sid = ctx.shape(d);
+  const lc = o.line || lineOf(fill);
+  const sw = o.sw ?? 2.8;
+  let s = use(sid, { fill });
+  if (o.pat) s += use(sid, { fill: o.pat });
+  if (o.extra) s = g(s + o.extra, { 'clip-path': ctx.clipUse(sid) });
+  if (o.shade !== false) {
+    const k = o.shade || 'lr';
+    s += k === 'lr' || k === 'skirt' ? rimShade(ctx, d) : use(sid, { fill: ctx.shade(k), style: MULTIPLY });
+  }
+  if (PAINT_MASK && !o.noMask) {
+    s += use(sid, { fill: 'none', stroke: lc, 'stroke-width': sw, 'stroke-linejoin': 'round', mask: PAINT_MASK.hide });
+    if (PAINT_MASK.seam) s += use(sid, { fill: 'none', stroke: lc, 'stroke-width': 1.5, 'stroke-linejoin': 'round', opacity: .7, mask: PAINT_MASK.seam });
+  } else s += use(sid, { fill: 'none', stroke: lc, 'stroke-width': sw, 'stroke-linejoin': 'round' });
+  return s;
+}
+/* fill only + outline (no shading) */
+const flat = (d, fill, line, sw = 2.6, o = {}) => path(d, { fill, stroke: line || lineOf(fill), 'stroke-width': sw, 'stroke-linejoin': 'round', ...o });
+
+/* ---------- fabric patterns ---------- */
+const PATTERNS = [
+  { id: 'none', name: '纯色' },
+  { id: 'stripe', name: '海魂条' },
+  { id: 'pin', name: '细条纹' },
+  { id: 'dot', name: '波点' },
+  { id: 'gingham', name: '格子' },
+  { id: 'plaid', name: '格纹' },
+  { id: 'tartan', name: '大格纹' },
+  { id: 'houndstooth', name: '千鸟格' },
+  { id: 'argyle', name: '菱格' },
+  { id: 'herring', name: '人字纹' },
+  { id: 'repp', name: '斜条' },
+  { id: 'heart', name: '爱心' },
+  { id: 'star', name: '星星' },
+  { id: 'flower', name: '小花' },
+  { id: 'cord', name: '灯芯绒' },
+];
+function patternMarkup(type, c, base) {
+  const P = (w, h, inner, extra = '') => `<pattern id="__ID__" width="${w}" height="${h}" patternUnits="userSpaceOnUse" ${extra}>${inner}</pattern>`;
+  const heart = (x, y, s) => `<path d="M${x},${y + s * .9}C${x - s * 1.6},${y - s * .2} ${x - s * .7},${y - s * 1.3} ${x},${y - s * .35}C${x + s * .7},${y - s * 1.3} ${x + s * 1.6},${y - s * .2} ${x},${y + s * .9}Z" fill="${c}"/>`;
+  const star = (x, y, r) => { let d = ''; for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? r * .45 : r; d += (i ? 'L' : 'M') + r1(x + Math.cos(a) * rr) + ',' + r1(y + Math.sin(a) * rr); } return `<path d="${d}Z" fill="${c}"/>`; };
+  switch (type) {
+    case 'stripe': return P(14, 14, `<rect width="14" height="5.5" fill="${c}"/>`);
+    case 'pin': return P(9, 9, `<rect width="2" height="9" fill="${c}"/>`);
+    case 'dot': return P(16, 16, `<circle cx="4" cy="4" r="2.7" fill="${c}"/><circle cx="12" cy="12" r="2.7" fill="${c}"/>`);
+    case 'gingham': return P(14, 14, `<rect width="7" height="14" fill="${c}" opacity=".42"/><rect width="14" height="7" fill="${c}" opacity=".42"/>`);
+    case 'plaid': return P(28, 28, `<rect width="10" height="28" fill="${c}" opacity=".38"/><rect width="28" height="10" fill="${c}" opacity=".38"/><rect x="16" width="2" height="28" fill="${c}" opacity=".75"/><rect y="16" width="28" height="2" fill="${c}" opacity=".75"/><rect x="22" width="1" height="28" fill="${base ? lighten(base, .6) : '#fff'}" opacity=".5"/><rect y="22" width="28" height="1" fill="${base ? lighten(base, .6) : '#fff'}" opacity=".5"/>`);
+    case 'tartan': return P(50, 50, `<rect width="22" height="50" fill="${c}" opacity=".78"/><rect width="50" height="22" fill="${c}" opacity=".6"/><rect x="35" width="2.2" height="50" fill="#170c14" opacity=".45"/><rect y="35" width="50" height="2.2" fill="#170c14" opacity=".45"/><rect x="10.5" width="1.3" height="50" fill="${base ? lighten(base, .5) : '#fff'}" opacity=".4"/><rect y="10.5" width="50" height="1.3" fill="${base ? lighten(base, .5) : '#fff'}" opacity=".4"/>`);
+    case 'houndstooth': return P(12, 12, `<path d="M0,0H6V6H0ZM6,0H9L12,3V6ZM0,6H3L6,9V12Z" fill="${c}"/>`);
+    case 'argyle': return P(22, 30, `<path d="M11,0L22,15L11,30L0,15Z" fill="${c}" opacity=".55"/><path d="M0,0L22,30M22,0L0,30" stroke="${base ? lighten(base, .55) : '#fff'}" stroke-width="1" stroke-dasharray="2.5 2" opacity=".8"/>`);
+    case 'herring': return P(12, 12, `<path d="M0,3L6,-3M0,9L6,3M0,15L6,9M6,-3L12,3M6,3L12,9M6,9L12,15" stroke="${c}" stroke-width="1.7" opacity=".7"/>`);
+    case 'repp': return P(16, 16, `<rect width="16" height="5" fill="${c}"/><rect y="7.5" width="16" height="1.6" fill="${c}" opacity=".7"/>`, 'patternTransform="rotate(-38)"');
+    case 'heart': return P(20, 20, heart(5, 5, 3.2) + heart(15, 15, 3.2));
+    case 'star': return P(22, 22, star(5.5, 5.5, 4) + star(16.5, 16.5, 4));
+    case 'flower': {
+      const f = (x, y) => { let s = ''; for (let i = 0; i < 5; i++) { const a = i * Math.PI * 2 / 5 - Math.PI / 2; s += `<circle cx="${r1(x + Math.cos(a) * 2.6)}" cy="${r1(y + Math.sin(a) * 2.6)}" r="2.1" fill="${c}"/>`; } return s + `<circle cx="${x}" cy="${y}" r="1.5" fill="#fff6c9"/>`; };
+      return P(22, 22, f(5.5, 5.5) + f(16.5, 16.5));
+    }
+    case 'cord': return P(7, 7, `<rect width="2.6" height="7" fill="${c}" opacity=".45"/>`);
+  }
+  return P(10, 10, '');
+}
+
+/* ---------- shadows ----------
+   Shadows are painted the way illustrators paint them: one light lilac multiplied over whatever is underneath
+   (正片叠底 / Multiply). That darkens a colour but keeps its hue and saturation; a dark colour laid over it with
+   normal blending greys it and looks dirty. depth is on the scale the art was tuned with (.07 a faint crease, .22
+   a deep shadow) and SHADOW_GAIN turns it into the lilac's opacity: from about .14 up a shadow is the full lilac.
+   A multiplied shape only darkens what was drawn before it in the same group, and a group that is clipped, masked
+   or faded is drawn on its own first: inside such a group, the fill a shadow falls on must be in the group too. */
+const SHADOW_TINT = '#d9c8e0', SHADOW_GAIN = 7.3, MULTIPLY = 'mix-blend-mode:multiply';
+const shadowAt = depth => +Math.min(1, depth * SHADOW_GAIN).toFixed(3);
+const shadowFill = (depth, o = {}) => Object.assign({ fill: SHADOW_TINT, opacity: shadowAt(depth), style: MULTIPLY }, o);
+
+/* side shadow that follows a piece's own outline (light from the upper left): the shape minus itself nudged
+   up-left leaves a strip along its right and lower edges; narrow pieces get a narrower strip */
+function rimShade(ctx, d, depth = .15, o = {}) {
+  const xs = (d.match(/-?\d+(\.\d+)?/g) || []).map(Number).filter((v, i) => i % 2 === 0);
+  const w = xs.length ? Math.max(...xs) - Math.min(...xs) : 40;
+  const dx = clamp(w * .16, 2, o.dx ?? 9), dy = o.dy ?? r1(Math.min(3, dx * .3));
+  // an absolute path is shifted by hand: the shape and its shifted copy filled even-odd, clipped to the shape, is the
+  // strip (a clip is much cheaper to draw than a mask); a path with relative commands falls back to a mask
+  if (!/[a-df-z]/.test(d.replace(/e-?\d/g, ''))) {
+    let i = 0;
+    const moved = d.replace(/-?\d+(\.\d+)?/g, v => r1(+v + (i++ % 2 ? -dy : -dx)));
+    return path(d + moved, shadowFill(depth, { 'fill-rule': 'evenodd', 'clip-path': o.clip || ctx.clip(d) }));
+  }
+  return path(d, shadowFill(depth, Object.assign({ mask: shiftMask(ctx, d, -dx, -dy) }, o.clip ? { 'clip-path': o.clip } : {})));
+}
+/* the shadow a shape casts on whatever it lies on: the shape nudged down-right, multiplied in under it, kept inside
+   clip (the fabric known to be underneath, so it never falls on the background) */
+const dropShadow = (d, clip, depth = .14, dx = 1.6, dy = 2.6) =>
+  g(path(d, { fill: SHADOW_TINT, opacity: shadowAt(depth), transform: `translate(${dx},${dy})` }), { 'clip-path': clip, style: MULTIPLY });
+/* the same for a whole drawn part (any markup): its silhouette through a filter. Costlier: small parts only */
+function castShadow(ctx, markup, clip, depth = .14, dx = 1.6, dy = 2.6) {
+  const k = `cast-${dx}-${dy}-${shadowAt(depth)}`;
+  ctx.def(k, `<filter id="__ID__" x="-5%" y="-5%" width="110%" height="110%" color-interpolation-filters="sRGB"><feOffset in="SourceAlpha" dx="${dx}" dy="${dy}" result="o"/><feFlood flood-color="${SHADOW_TINT}" flood-opacity="${shadowAt(depth)}"/><feComposite in2="o" operator="in"/></filter>`);
+  return g(g(markup, { filter: ctx.url(k) }), { 'clip-path': clip, style: MULTIPLY });
+}
+
+/* cel light inside a shape: shadow where the shape nudged up-left no longer covers it (the lower-right rim),
+   and a lighter tone where the shape nudged down-right no longer covers it (the upper-left rim) */
+function shiftMask(ctx, d, dx, dy) {
+  const k = ctx.next('hm');
+  ctx.def(k, `<mask id="__ID__" maskUnits="userSpaceOnUse" x="-300" y="-300" width="1000" height="1000"><rect x="-300" y="-300" width="1000" height="1000" fill="#fff"/><path d="${d}" fill="#000" transform="translate(${dx},${dy})"/></mask>`);
+  return ctx.url(k);
+}
+const celShade = (ctx, d, dx = 9, dy = 6, op = .16) => path(d, shadowFill(op, { mask: shiftMask(ctx, d, -dx, -dy) }));
+const celLit = (ctx, d, dx = 8, dy = 8, op = .16) => path(d, { fill: '#fff', opacity: op, mask: shiftMask(ctx, d, dx, dy) });
+
+
+/* ---- body.js ---- */
+/* ===== body.js — parametric body, poses (IK arms), limbs, paws ===== */
+const BODIES = {
+  girl: { name: '少女', fx: 3, sh: 49, ch: 39, wa: 32, hi: 47, neck: 17, arm: 13, L1: 66, L2: 62, gap: 1.5,
+          kc: 24.5, kw: 17, cc: 25.5, cw: 17.6, ac: 28, aw: 14.1 },
+  boy:  { name: '少年', fx: 3, sh: 58, ch: 46, wa: 42, hi: 45, neck: 18.5, arm: 14, L1: 64, L2: 60, gap: 2,
+          kc: 25, kw: 17.6, cc: 26, cw: 18, ac: 28.5, aw: 14.5 },
+  chub: { name: '圆滚滚', fx: 3, sh: 61, ch: 63, wa: 63, hi: 61, neck: 20, arm: 16, L1: 66, L2: 62, gap: 1.5,
+          kc: 30.5, kw: 21, cc: 31.5, cw: 21.6, ac: 33.5, aw: 16.5 },
+};
+const Y = { neck: 292, sh: 324, chest: 368, waist: 412, hip: 452, crotch: 488, knee: 582, calf: 618, ankle: 668, sole: 704 };
+
+const POSES = [
+  { id: 'stand', name: '站立', L: 'down', R: 'down' },
+  { id: 'wave', name: '挥手', L: 'wave', R: 'down' },
+  { id: 'hips', name: '叉腰', L: 'hip', R: 'hip' },
+  { id: 'cheer', name: '欢呼', L: 'up', R: 'up' },
+  { id: 'hold', name: '捧手', L: 'front', R: 'front' },
+];
+
+/* compute geometry for the current state */
+function buildGeom(st) {
+  const p = BODIES[st.body] || BODIES.girl;
+  const K = Object.assign({}, p);
+  const pose = POSES.find(q => q.id === st.pose) || POSES[0];
+  let cfgL = pose.L, cfgR = pose.R;
+  const held = st.wear && st.wear.held ? ITEM_INDEX.held[st.wear.held.id] : null;
+  if (held) {
+    if (held.grip === 'front') { cfgL = 'front'; cfgR = 'front'; }
+    else { cfgR = held.grip; if (cfgL === 'front') cfgL = 'down'; }
+  }
+  K.bulk = armBulk(st);
+  K.armR = armGeom(K, cfgR, 1);
+  K.armL = armGeom(K, cfgL, -1);
+  K.itemArm = held ? K.armR : null;
+  return K;
+}
+
+/* how far an arm held in front ('front': 捧手 / 捧花) must stand off the side of the body at the elbow, beyond the
+   fur: the garment body's ease (more for a coat) plus the ease of any sleeve long enough to reach the elbow */
+function armBulk(st) {
+  const W = st.wear || {};
+  let body = 2.5, sleeve = 0;
+  for (const s of ['top', 'dress', 'outer']) {
+    const def = W[s] && ITEM_INDEX[s] && ITEM_INDEX[s][W[s].id];
+    if (!def) continue;
+    if (s === 'outer') body = Math.max(body, (def.sleeve ? def.sleeve.ease : 4) + 2);
+    if (def.sleeve && def.sleeve.len > .45) sleeve = Math.max(sleeve, def.sleeve.ease + (def.sleeve.flare || 0));
+  }
+  return body + sleeve + 2;
+}
+function armGeom(K, cfg, side) {
+  const Sx = CX + K.sh - 3, Sy = 327;
+  const S0 = { x: Sx, y: Sy };
+  let T, bend = -1, L2 = K.L2, hand = 'fist', frontFrom = 0.56;
+  switch (cfg) {
+    case 'down': {   // nearly straight arm hanging slightly outward (reference pose)
+      const tx = CX + Math.max(K.hi, K.ch) + K.arm + 24 - Sx, ty = K.L1 + K.L2 - 6, dl = Math.hypot(tx, ty), reach = K.L1 + K.L2 - 2.5;
+      T = { x: Sx + tx / dl * reach, y: Sy + ty / dl * reach }; break;
+    }
+    case 'hip': T = { x: CX + K.wa + 9, y: 419 }; break;
+    case 'wave': T = { x: Math.max(Sx + 92, CX + 148), y: Sy - 58 }; bend = 1; hand = 'open'; frontFrom = 0; break;
+    case 'up': T = { x: Math.max(Sx + 74, CX + 134), y: Sy - 104 }; bend = 1; hand = 'open'; frontFrom = 0; break;
+    case 'cup': T = { x: CX + 30, y: Sy + 50 }; L2 = K.L2 * 0.7; hand = 'grip'; frontFrom = 0.5; break;
+    case 'front': T = { x: CX + 13, y: 440 }; hand = 'grip'; frontFrom = 0.5; break;
+    default: T = { x: Sx + 19, y: Sy + 140 };
+  }
+  let r;
+  if (cfg === 'front') {
+    /* hands together in front: the upper arm hangs down the side of the body like a hanging arm, its elbow just
+       clear of the body and the clothes, so the shoulder and armpit are drawn exactly as when standing; only the
+       forearm comes round in front. A forearm that can't reach the middle points at it (a round body in a thick
+       coat rests its paws on the tummy). */
+    const w = K.arm - .9, need = y => CX + torsoHalfAt(K, y) + w + K.bulk;
+    let E = null;
+    for (let k = 0; k <= 70; k++) {
+      const th = k * .01;
+      E = { x: Sx + Math.sin(th) * K.L1, y: Sy + Math.cos(th) * K.L1 };
+      if (E.x >= need(E.y)) break;
+    }
+    const d = Math.hypot(T.x - E.x, T.y - E.y);
+    r = { E, W: d > L2 ? { x: E.x + (T.x - E.x) / d * L2, y: E.y + (T.y - E.y) / d * L2 } : T };
+  } else r = ik(S0, T, K.L1, L2, bend);
+  let pts = [S0, r.E, r.W];
+  if (side < 0) pts = pts.map(q => ({ x: mirX(q.x), y: q.y }));
+  const [S, E, W] = pts;
+  const dir = { x: W.x - E.x, y: W.y - E.y }; const dl = Math.hypot(dir.x, dir.y); dir.x /= dl; dir.y /= dl;
+  return { cfg, side, S, E, W, pts, len: plen(pts), dir, hand, frontFrom };
+}
+
+/* ---------- torso ---------- */
+function torsoRight(K) {
+  return [[CX, 256], [CX + K.neck, 256], [CX + K.neck, 288], [CX + K.neck + 7, 298], [CX + K.sh - 12, 304],
+    [CX + K.sh - 1, 313], [CX + K.sh - 4, 328], [CX + K.ch + 1, 350], [CX + K.ch, 371], [CX + K.wa, 412], [CX + K.hi, 452],
+    [CX + K.hi - 5, 478], [CX + K.hi * 0.5, 492], [CX, 494]];
+}
+function torsoHalfAt(K, y) {
+  const P = torsoRight(K);
+  for (let i = 1; i < P.length; i++) if (P[i][1] >= y && P[i - 1][1] <= y) {
+    const t = (y - P[i - 1][1]) / Math.max(1e-6, P[i][1] - P[i - 1][1]);
+    return lerp(P[i - 1][0], P[i][0], t) - CX;
+  }
+  return K.wa;
+}
+/* one leg outline (s = -1 viewer-left, +1 viewer-right). add: extra half-widths for garments */
+function legPts(K, s, add = {}, hemY = null) {
+  const X = dx => CX + s * dx;
+  const a = Object.assign({ top: 0, thigh: 0, knee: 0, calf: 0, ankle: 0, inner: 0 }, add);
+  const outer = [
+    [X(K.hi + a.top - 0.5), 446], [X(lerp(K.hi, K.kc + K.kw, 0.5) + 1 + a.thigh), 526],
+    [X(K.kc + K.kw + a.knee), Y.knee], [X(K.cc + K.cw + a.calf), Y.calf], [X(K.ac + K.aw + a.ankle), Y.ankle]];
+  const inner = [
+    [X(K.ac - K.aw - a.ankle * 0.5 - a.inner), Y.ankle], [X(K.cc - K.cw + 1 - a.calf * 0.5 - a.inner), Y.calf + 2],
+    [X(K.kc - K.kw - a.knee * 0.5 - a.inner), Y.knee], [X(K.gap + 1 + (K.kc - K.kw - K.gap) * 0.32 - a.thigh * 0.3 - a.inner), 526],
+    [X(Math.max(0, K.gap - a.inner)), Y.crotch]];
+  return { outer, inner };
+}
+/* x of the outer leg edge at height y (rough, for hems) */
+function legEdgeAt(K, y, add = 0) {
+  const ys = [446, 526, Y.knee, Y.calf, Y.ankle], xo = [K.hi, lerp(K.hi, K.kc + K.kw, .5) + 1, K.kc + K.kw, K.cc + K.cw, K.ac + K.aw];
+  const xi = [K.gap, K.gap + 1 + (K.kc - K.kw - K.gap) * .32, K.kc - K.kw, K.cc - K.cw + 1, K.ac - K.aw];
+  for (let i = 1; i < ys.length; i++) if (y <= ys[i]) { const t = (y - ys[i - 1]) / (ys[i] - ys[i - 1]); return { o: lerp(xo[i - 1], xo[i], t) + add, i: lerp(xi[i - 1], xi[i], t) - add * .5 }; }
+  return { o: xo[4] + add, i: xi[4] - add * .5 };
+}
+function legPath(K, s, add, cut = 682) {
+  const { outer, inner } = legPts(K, s, add);
+  const X = dx => CX + s * dx;
+  const pts = [[X(K.gap), 444, 1], ...outer, [outer[4][0], cut, 1], [inner[0][0], cut, 1], ...inner, [X(K.gap), Y.crotch, 1]];
+  return smooth(pts);
+}
+/* region of one leg between y0 and y1 (used for socks); add = looseness */
+function legBand(K, s, y0, y1, add = 1.2, topRound = 0) {
+  const X = dx => CX + s * dx;
+  const ys = [];
+  for (let y = y0; y < y1; y += 14) ys.push(y);
+  ys.push(y1);
+  const out = ys.map(y => { const e = legEdgeAt(K, y, add); return [X(e.o), y]; });
+  const inn = ys.slice().reverse().map(y => { const e = legEdgeAt(K, y, add); return [X(e.i), y]; });
+  out[0][2] = 1; inn[inn.length - 1][2] = 1; out[out.length - 1][2] = 1; inn[0][2] = 1;
+  if (topRound) { out[0][1] += topRound * 0.2; }
+  return smooth([...out, ...inn]);
+}
+
+/* ---------- paws ---------- */
+function footPts(K, s) {
+  const X = dx => CX + s * dx;
+  return [[X(K.ac - K.aw), 660], [X(K.ac + K.aw), 660], [X(K.ac + K.aw + 6), 678], [X(K.ac + K.aw + 9), 693], [X(K.ac + K.aw + 4), 704],
+    [X(K.ac + 1), 707], [X(K.ac - K.aw - 5), 704], [X(K.ac - K.aw - 7), 692], [X(K.ac - K.aw - 4), 676]];
+}
+/* big round bare paw (reference style); returns outline + toe creases for one side */
+function toonFoot(K, sd) {
+  const X = dx => CX + sd * dx;
+  const a = K.ac, w = K.aw;
+  const d = smooth([[X(a - w + 1), 646], [X(a - w - 4), 666], [X(a - w - 9), 684], [X(a - w - 8), 700], [X(a - w - 2), 708], [X(a + 1), 710.5], [X(a + w + 4), 708],
+    [X(a + w + 10), 699], [X(a + w + 11), 682], [X(a + w + 5), 664], [X(a + w - 1), 646]]);
+  const toes = `M${X(a - 6)},709Q${X(a - 6.5)},701 ${X(a - 5.5)},693M${X(a + 7)},709Q${X(a + 7.5)},701 ${X(a + 6.5)},693`;
+  return { d, toes };
+}
+function drawFeet(ctx, K, col) {
+  const lc = lineOf(col);
+  let s = '';
+  for (const sd of [-1, 1]) {
+    const X = dx => CX + sd * dx;
+    s += flat(smooth(footPts(K, sd)), col, lc, 2.6);
+    s += ln(`M${X(K.ac - 4)},706Q${X(K.ac - 4)},700 ${X(K.ac - 3)},696M${X(K.ac + 5)},706Q${X(K.ac + 6)},700 ${X(K.ac + 6)},696`, lc, 1.8, { opacity: .7 });
+  }
+  return s;
+}
+/* point where a held item attaches (center of the paw) */
+function gripPoint(arm, K) {
+  const r = K.arm + 1.6;
+  return { x: arm.W.x + arm.dir.x * r * 1.05, y: arm.W.y + arm.dir.y * r * 1.05 };
+}
+
+/* ---------- one-piece arm: shoulder, upper arm, elbow, forearm, wrist and paw share a single outline ---------- */
+/* fur half-width along the arm: starts slim (hidden in the shoulder), upper arm, slimmer elbow, forearm, wrist */
+function armFurWidth(K) {
+  const a = K.arm;
+  return t => t < .5 ? lerp(a + .8, a - .9, t / .5)
+      : t < .72 ? lerp(a - .9, a - .2, Math.sin((t - .5) / .22 * Math.PI / 2))
+        : lerp(a - .2, a - 2.4, (t - .72) / .28);
+}
+/* paw outlines in the wrist frame for a right arm (x < 0 = thumb side for a fist), from the left
+   wrist edge to the right one. u/v are in paw units; the first/last points are replaced by the wrist. */
+const PAW_FIST = [[-1, 0], [-1, .2, 'w'], [-.98, .52], [-1.17, 1.0], [-1.06, 1.46], [-.8, 1.72, 1], [-.6, 1.96], [-.37, 2.1], [-.13, 2.1, 1], [.13, 2.18], [.4, 2.1, 1],
+  [.66, 2.03], [.97, 1.72], [1.09, 1.2], [.98, .6], [1, .2, 'w'], [1, 0]];
+const PAW_OPEN = [[-1, 0], [-1, .25, 'w'], [-1.15, 1.0], [-1.05, 1.75, 1], [-.62, 2.05], [-.3, 2.2, 1], [0, 2.28], [.3, 2.2, 1], [.62, 2.05], [1.05, 1.75, 1], [1.25, 1.1],
+  [1.65, .55], [1.1, .25], [1, .1, 'w'], [1, 0]];
+function armShape(arm, K) {
+  if (arm._shape) return arm._shape;
+  const sp = samplePolyline(arm.pts, 5, 12);
+  const N = normals(sp), n = sp.length;
+  const wf = armFurWidth(K);
+  let L = [], Rt = [];
+  for (let i = 0; i < n; i++) {
+    const w = wf(i / (n - 1));
+    L.push({ x: sp[i].x + N[i].x * w, y: sp[i].y + N[i].y * w });
+    Rt.push({ x: sp[i].x - N[i].x * w, y: sp[i].y - N[i].y * w });
+  }
+  L = deloop(L); Rt = deloop(Rt);
+  // wrist frame: x across (left edge = -ww), y along the forearm
+  const W = sp[n - 1], d = { x: N[n - 1].tx, y: N[n - 1].ty }, ww = wf(1);
+  const toS = (x, y) => ({ x: W.x + x * d.y + y * d.x, y: W.y - x * d.x + y * d.y });
+  const open = arm.hand === 'open';
+  const U = (K.arm + 1.6) * (open ? 1.18 : 1.2);
+  const mir = arm.side < 0;
+  const local = (pts) => {
+    let q = pts.map(([u, v, c]) => {
+      let x = c === 'w' ? Math.sign(u) * (ww + U * .07) : u * U;
+      if (Math.abs(u) === 1 && v === 0 && c === undefined) x = Math.sign(u) * ww;
+      return [x, v * U, c === 1];
+    });
+    if (mir) q = q.map(([x, y, c]) => [-x, y, c]).reverse();
+    return q;
+  };
+  const paw = local(open ? PAW_OPEN : PAW_FIST).slice(1, -1).map(([x, y, c]) => Object.assign(toS(x, y), { c }));
+  // shoulder: small round cap tucked inside the torso
+  const w0 = wf(0), n0 = N[0], cap = [];
+  for (let k = 1; k < 6; k++) { const a = Math.PI * k / 6; cap.push({ x: sp[0].x - n0.x * w0 * Math.cos(a) - n0.tx * w0 * Math.sin(a), y: sp[0].y - n0.y * w0 * Math.cos(a) - n0.ty * w0 * Math.sin(a) }); }
+  const d0 = smooth([...L, ...paw, ...Rt.slice().reverse(), ...cap], true);
+  // paw on its own (drawn again on top of held items / in front of the head): fill closes a little way up the forearm,
+  // the outline only follows the paw contour
+  const m = L.length - 1, mr = Rt.length - 1, back = Math.min(3, m, mr);
+  const contour = [L[m], ...paw, Rt[mr]];
+  // the closing points up the forearm are corners: smoothed, the fill bulged out past the forearm's outline at the wrist
+  const corner = q => Object.assign({}, q, { c: true });
+  const pawFill = smooth([corner(L[m - back]), corner(L[m]), ...paw, corner(Rt[mr]), corner(Rt[mr - back])], true);
+  const pawLine = smooth(contour, false);
+  const cx = contour.reduce((a, p) => a + p.x, 0) / contour.length, cy = contour.reduce((a, p) => a + p.y, 0) / contour.length;
+  const grow = q => { const dx = q.x - cx, dy = q.y - cy, l = Math.hypot(dx, dy) || 1; return [q.x + dx / l * 5, q.y + dy / l * 5]; };
+  const pawClip = poly([[L[m - back].x, L[m - back].y], ...contour.map(grow), [Rt[mr - back].x, Rt[mr - back].y]]) + 'Z';
+  // paw details in screen space
+  const P = (u, v) => { const x = (mir ? -u : u) * U; const p = toS(x, v * U); return `${r1(p.x)},${r1(p.y)}`; };
+  let creases = '', pads = '';
+  if (open) {
+    const palm = [[-.45, .78], [0, .62], [.45, .78], [.32, 1.18], [0, 1.28], [-.32, 1.18]].map(([u, v]) => toS((mir ? -u : u) * U, v * U));
+    pads = smooth(palm);
+    pads = { palm: pads, toes: [[-.6, 1.62], [-.2, 1.8], [.2, 1.8], [.6, 1.62]].map(([u, v]) => toS((mir ? -u : u) * U, v * U)), r: U * .19 };
+  } else {
+    const cr = (a, b) => `M${P(a[0], a[1])}Q${P((a[0] + b[0]) / 2 + .05, (a[1] + b[1]) / 2)} ${P(b[0], b[1])}`;
+    creases = cr([-.8, 1.72], [-.66, 1.22]) + cr([-.13, 2.1], [-.1, 1.56]) + cr([.4, 2.1], [.38, 1.58]);
+  }
+  return (arm._shape = { d: d0, sp, wf, U, creases, pads, pawFill, pawLine, pawClip });
+}
+
+/* ---------- arm & sleeve tubes ---------- */
+function armWidth(K) { return t => lerp(K.arm + 0.6, K.arm - 2.3, t); }
+/* tube along arm polyline from arc-length a to b. returns {d, open} (open = outline without the start edge) */
+function armTube(arm, K, a, b, wf, capA = 'round', capB = 'round', flare = 0) {
+  let pts = cutPolyline(arm.pts, Math.min(b, arm.len));
+  if (a > 0.5) pts = cutPolyline(pts.slice().reverse(), plen(pts) - a).reverse();
+  const sp = samplePolyline(pts, 6, 12);
+  const width = t => {
+    const tt = (a + t * sp.L) / arm.len;
+    return wf(tt) + (flare && t > 0.55 ? flare * Math.pow((t - 0.55) / 0.45, 1.6) : 0);
+  };
+  return { d: tube(sp, width, capA, capB), open: tubeOpen(sp, width, capB), sp, width };
+}
+
+/* ---- species.js ---- */
+/* ===== species.js — 7 anthro species: colourways, derived colours, tails, torso and legs (heads/ears live in toon.js) ===== */
+const SPECIES = {
+  fox: { name: '狐狸', ears: 'fox', tail: 'fox', nose: 'tri', paws: true, chest: true,
+    pals: [
+      { n: '赤狐', main: '#f7863a', sub: '#fee8cb', acc: '#7a3d30', inner: '#ffeacc', nose: '#4a211d', hair: '#f7863a', eye: '#43a4e5' },
+      { n: '北极狐', main: '#f2f4fa', sub: '#ffffff', acc: '#9aa2c2', inner: '#ffffff', nose: '#4a4560', hair: '#e6eaf6', eye: '#4fc3f7' },
+      { n: '银狐', main: '#8f98ad', sub: '#f2f3f8', acc: '#2f3142', inner: '#e9ebf2', nose: '#2f3142', hair: '#c3c9d8', eye: '#ffc23a' },
+      { n: '耳廓狐', main: '#f1d09d', sub: '#fff9ef', acc: '#c48a52', inner: '#ffe9d6', nose: '#5a3a2e', hair: '#f6dcae', eye: '#8a5a2a' },
+      { n: '樱花狐', main: '#ff9fc8', sub: '#fff2f8', acc: '#8b5cf6', inner: '#fff2f8', nose: '#6b3a73', hair: '#ffcfe5', eye: '#8b5cf6' },
+      { n: '星夜狐', main: '#5d6fd8', sub: '#e9edff', acc: '#1e1b4b', inner: '#e9edff', nose: '#1e1b4b', hair: '#9fb1ff', eye: '#ffcf4a' },
+    ] },
+  bunny: { name: '兔兔', ears: 'bunny', tail: 'bunny', nose: 'pink', teeth: true, chest: false,
+    pals: [
+      { n: '雪团兔', main: '#fbf7f3', sub: '#ffffff', acc: '#ffb3c6', inner: '#ffc4d6', nose: '#ff8fab', hair: '#fff0e4', eye: '#e2577f' },
+      { n: '奶茶兔', main: '#e8cdab', sub: '#fff7ec', acc: '#c9946a', inner: '#ffc9c0', nose: '#ff8f9f', hair: '#f3dcbf', eye: '#8a5a3a' },
+      { n: '灰灰兔', main: '#b8b3c6', sub: '#f1eff6', acc: '#8e88a0', inner: '#ffc6d8', nose: '#ff8fab', hair: '#d9d5e3', eye: '#5a6acf' },
+      { n: '可可兔', main: '#8d6248', sub: '#f2dcc8', acc: '#5e3f2d', inner: '#f9c0bd', nose: '#ff8f9f', hair: '#a77a5c', eye: '#e9a23b' },
+      { n: '薰衣草兔', main: '#cbb8ff', sub: '#f7f2ff', acc: '#9a83e6', inner: '#ffc4e3', nose: '#ff6fb0', hair: '#e6dbff', eye: '#7b5cf0' },
+      { n: '薄荷兔', main: '#a6e3cc', sub: '#f2fff9', acc: '#6cc2a3', inner: '#ffc9d6', nose: '#ff8fab', hair: '#d4f5e8', eye: '#23928a' },
+    ] },
+  cat: { name: '猫咪', ears: 'cat', tail: 'cat', nose: 'pink', whiskers: true, chest: true,
+    pals: [
+      { n: '橘猫', main: '#f5b065', sub: '#fff5e9', acc: '#d9772a', inner: '#ffbfcf', nose: '#ff8fa3', hair: '#f8c48a', eye: '#62b83f', stripes: true },
+      { n: '黑猫', main: '#3c3746', sub: '#57505f', acc: '#25212c', inner: '#ff9fb6', nose: '#2a2530', hair: '#4a4456', eye: '#ffcf3a' },
+      { n: '暹罗猫', main: '#f2e6d4', sub: '#fffaf2', acc: '#5e4639', inner: '#d9a7a0', nose: '#4a3630', hair: '#e9dccb', eye: '#3f92ec', points: true },
+      { n: '灰虎斑', main: '#a8afbd', sub: '#f3f4f7', acc: '#636a7a', inner: '#ffb6c8', nose: '#ff8fa3', hair: '#c4cad4', eye: '#6fbe44', stripes: true },
+      { n: '糖果猫', main: '#ffc4dd', sub: '#fff4fa', acc: '#ff86bb', inner: '#ff9fc8', nose: '#ff6fa8', hair: '#ffe0ee', eye: '#2bb5b5', stripes: true },
+      { n: '雪绒猫', main: '#fdfdfd', sub: '#ffffff', acc: '#d4cfe3', inner: '#ffc0d0', nose: '#ff9fb3', hair: '#f0eef6', eye: '#3f9cf5' },
+    ] },
+  wolf: { name: '狼', ears: 'wolf', tail: 'wolf', nose: 'tri', chest: true,
+    pals: [
+      { n: '灰狼', main: '#8e98a9', sub: '#eef1f6', acc: '#4b5263', inner: '#e6e9f0', nose: '#2c2f3a', hair: '#aab3c2', eye: '#f2b632' },
+      { n: '雪狼', main: '#eef2f8', sub: '#ffffff', acc: '#a9b3c8', inner: '#ffffff', nose: '#3a3f50', hair: '#ffffff', eye: '#4cb2ff' },
+      { n: '黑狼', main: '#3d4150', sub: '#8f95a6', acc: '#22242e', inner: '#6b7080', nose: '#1d1f27', hair: '#555a6c', eye: '#ff6060' },
+      { n: '赤狼', main: '#b9764c', sub: '#f3e2cf', acc: '#5e3a28', inner: '#f1dcc6', nose: '#2e211c', hair: '#cf9064', eye: '#94cf45' },
+      { n: '星紫狼', main: '#8a7ad8', sub: '#eae6ff', acc: '#3b2f80', inner: '#eae6ff', nose: '#2a2160', hair: '#b8adf5', eye: '#6ff0dc' },
+      { n: '冰蓝狼', main: '#6aa8e8', sub: '#eaf5ff', acc: '#24508a', inner: '#eaf5ff', nose: '#1d3557', hair: '#a8d0f5', eye: '#f6d743' },
+    ] },
+  bear: { name: '小熊', ears: 'bear', tail: 'bear', nose: 'big', chest: false,
+    pals: [
+      { n: '棕熊', main: '#a46f4b', sub: '#f1dcc3', acc: '#6b4630', inner: '#d9ab88', nose: '#3a2620', hair: '#b88560', eye: '#3a2620' },
+      { n: '蜂蜜熊', main: '#e7ae62', sub: '#fff2dc', acc: '#b77a35', inner: '#f8d29e', nose: '#4a2f20', hair: '#f0c27e', eye: '#5a3a20' },
+      { n: '北极熊', main: '#f7f6f2', sub: '#ffffff', acc: '#cfcabe', inner: '#ece6da', nose: '#2a2a33', hair: '#ffffff', eye: '#2a2a33' },
+      { n: '熊猫', main: '#f8f7f5', sub: '#ffffff', acc: '#2b2a33', inner: '#4a4852', nose: '#2b2a33', hair: '#ffffff', eye: '#2b2a33', panda: true },
+      { n: '草莓熊', main: '#ff9ab8', sub: '#fff0f5', acc: '#e05b8a', inner: '#ffc5d6', nose: '#8a2d52', hair: '#ffc2d5', eye: '#8a2d52' },
+      { n: '月牙熊', main: '#3a3540', sub: '#f2ece4', acc: '#221f26', inner: '#5a5462', nose: '#1a181e', hair: '#4a4452', eye: '#c08a3e', moon: true },
+    ] },
+  deer: { name: '小鹿', ears: 'deer', tail: 'deer', nose: 'tri', antlers: true, chest: true,
+    pals: [
+      { n: '梅花鹿', main: '#c98b55', sub: '#fff4e4', acc: '#5a3a29', inner: '#f2c9a6', nose: '#2e211c', antler: '#f0dcc0', hair: '#d9a06d', eye: '#6b3e26', spots: true },
+      { n: '驯鹿', main: '#9b7a63', sub: '#f2e6da', acc: '#4a3a30', inner: '#d9c0ae', nose: '#e63946', antler: '#e8d5b5', hair: '#b8977e', eye: '#4a3a30' },
+      { n: '白鹿', main: '#f4efe7', sub: '#ffffff', acc: '#c9b79c', inner: '#f6dfd0', nose: '#6b5a4a', antler: '#f2c75c', hair: '#fffaf2', eye: '#b07cff' },
+      { n: '樱花鹿', main: '#f7b8c8', sub: '#fff4f7', acc: '#b5577a', inner: '#ffd6e2', nose: '#8a3a5a', antler: '#fff0f5', hair: '#ffd9e4', eye: '#e2577f', spots: true },
+      { n: '月光鹿', main: '#7d8fd9', sub: '#eef1ff', acc: '#2c3470', inner: '#c9d1ff', nose: '#2c3470', antler: '#dfe6ff', hair: '#b3c0f5', eye: '#ffcf4a', spots: true },
+    ] },
+  tiger: { name: '老虎', ears: 'tiger', tail: 'tiger', nose: 'pinktri', stripes: true, chest: true,
+    pals: [
+      { n: '孟加拉虎', main: '#f39a38', sub: '#fff6ea', acc: '#2c2230', inner: '#fff6ea', nose: '#e8798f', hair: '#f7ad55', eye: '#8fcb40' },
+      { n: '白虎', main: '#f6f4f1', sub: '#ffffff', acc: '#3a3946', inner: '#ffffff', nose: '#f08ca0', hair: '#ffffff', eye: '#4cb2ff' },
+      { n: '金虎', main: '#f2c66e', sub: '#fff8ea', acc: '#a8682e', inner: '#fff8ea', nose: '#d9776a', hair: '#f7d68f', eye: '#23928a' },
+      { n: '暗夜虎', main: '#4a4560', sub: '#d8d3e8', acc: '#16141f', inner: '#d8d3e8', nose: '#ff6f91', hair: '#6a6485', eye: '#ff9f1c' },
+      { n: '霓虹虎', main: '#ff8ad8', sub: '#fff0fb', acc: '#5b2a86', inner: '#fff0fb', nose: '#5b2a86', hair: '#ffc2ec', eye: '#30d5c8' },
+    ] },
+};
+const SPECIES_ORDER = ['fox', 'bunny', 'cat', 'wolf', 'bear', 'deer', 'tiger'];
+const DEFAULT_NAMES = { fox: '橘子', bunny: '团子', cat: '布丁', wolf: '阿灰', bear: '可可', deer: '小栗', tiger: '大福' };
+
+/* derived fur colors used across the renderer */
+function furColors(st) {
+  const sp = SPECIES[st.species], f = st.fur;
+  const limb = f.panda ? f.acc : f.main;
+  return {
+    main: f.main, sub: f.sub, acc: f.acc, inner: f.inner || f.sub, nose: f.nose, antler: f.antler || '#f0dcc0',
+    line: lineOf(f.main), limb, limbLine: lineOf(limb),
+    hand: (sp.paws || f.points || f.panda) ? f.acc : f.main,
+    foot: (sp.paws || f.points || f.panda) ? f.acc : f.main,
+    pad: isLight(f.main) ? '#ff9fb6' : '#ffb0c4',
+  };
+}
+
+/* ---------- head & ears: reference-style parts in toon.js ---------- */
+function drawEars(ctx, st, F) { return drawToonEars(ctx, st, F); }
+function drawHead(ctx, st, F) { return drawToonHead(ctx, st, F); }
+
+/* ---------- tails ---------- */
+function tailAnchor(K) { return { x: CX - K.hi + 16, y: 462 }; }
+function drawTail(ctx, st, F, K) {
+  const sp = SPECIES[st.species];
+  const A = tailAnchor(K);
+  if (TOON_TAILS[sp.tail]) return drawToonTail(ctx, st, F, A);
+  if (sp.tail === 'cat' || sp.tail === 'tiger') return drawToonLongTail(ctx, st, F, A);
+  // short tails peek out beside the hip
+  const lc = F.line;
+  let s = '';
+  switch (sp.tail) {
+    case 'bunny': {
+      const pts = []; for (let i = 0; i < 14; i++) { const a = i / 14 * Math.PI * 2, r = i % 2 ? 15 : 19; pts.push([-12 + Math.cos(a) * r, -2 + Math.sin(a) * r, i % 2 === 0]); }
+      s += flat(smooth(pts), F.sub, lineOf(F.sub), 2.6);
+      break;
+    }
+    case 'deer':
+      s += flat(smooth([[0, -8], [-14, -10], [-24, 2], [-20, 16, 1], [-8, 8], [2, 6]]), F.main, lc, 2.6) + path(smooth([[-6, 0], [-18, 4], [-18, 12, 1], [-8, 6]]), { fill: F.sub });
+      break;
+    case 'bear': s += circ(-8, 0, 12, { fill: st.fur.panda ? F.acc : F.main, stroke: lc, 'stroke-width': 2.6 }); break;
+  }
+  return g(g(s, { transform: `translate(${A.x},${A.y})` }), { class: 'tail', style: `transform-origin:${A.x}px ${A.y}px` });
+}
+
+/* ---------- torso fur + markings ---------- */
+function drawTorso(ctx, st, F, K, lineMask) {
+  const sp = SPECIES[st.species], pal = st.fur;
+  const d = S(torsoRight(K));
+  const sid = ctx.shape(d);
+  let m = ell(200, 297, K.neck + 7, 8, shadowFill(.22));
+  if (sp.chest || pal.moon) {
+    const c = F.sub;
+    if (pal.moon) m += path('M168,318Q200,346 232,318Q226,336 200,340Q174,336 168,318Z', { fill: c });
+    else m += path(S([[200, 286], [214, 292], [224, 310, 1], [216, 316], [222, 332, 1], [212, 334], [208, 350, 1], [200, 344]]), { fill: c });
+  }
+  if (sp.tail === 'bear' && !pal.moon && !pal.panda) m += ell(200, 418, K.wa - 6, 50, { fill: F.sub, opacity: .9 });
+  if (pal.panda) m += path(S([[200, 300], [CX + K.neck + 4, 300], [CX + K.sh + 10, 316], [CX + K.sh + 10, 360], [CX + K.ch - 6, 368], [200, 352]]), { fill: F.acc });
+  let s = g(use(sid, { fill: F.main }) + m + rimShade(ctx, d), { 'clip-path': ctx.clipUse(sid) });
+  s += use(sid, Object.assign({ fill: 'none', stroke: F.line, 'stroke-width': 2.8, 'stroke-linejoin': 'round' }, lineMask ? { mask: lineMask } : {}));
+  return s;
+}
+function drawLegs(ctx, st, F, K, bare = false) {
+  const sp = SPECIES[st.species];
+  let s = '';
+  for (const sd of [-1, 1]) {
+    const d = legPath(K, sd, {});
+    const sid = ctx.shape(d);
+    const foot = bare ? toonFoot(K, sd) : null;
+    let m = '';
+    if (sp.stripes) for (const y of [540, 572, 604, 636]) { const e = legEdgeAt(K, y); const X = dx => CX + sd * dx; m += path(`M${X(e.o + 4)},${y - 6}L${X((e.o + e.i) / 2)},${y}L${X(e.o + 4)},${y + 6}Z`, { fill: F.acc }); }
+    if (sp.paws) m += path(sockD(K, sd, 604), { fill: F.acc });
+    if (foot) {
+      const fid = ctx.shape(foot.d), fl = lineOf(F.foot);
+      s += use(sid, { fill: 'none', stroke: F.limbLine, 'stroke-width': 5.4, 'stroke-linejoin': 'round' }) + use(fid, { fill: 'none', stroke: fl, 'stroke-width': 5.4, 'stroke-linejoin': 'round' })
+        + g(use(sid, { fill: F.limb }) + m + rimShade(ctx, d), { 'clip-path': ctx.clipUse(sid) })
+        + g(use(fid, { fill: F.foot }) + path(`M${CX + sd * K.ac + K.aw - 2},640L${CX + sd * K.ac + K.aw + 30},640L${CX + sd * K.ac + K.aw + 30},720L${CX + sd * K.ac + 3},720Z`, shadowFill(.12)), { 'clip-path': ctx.clipUse(fid) })
+        + ln(foot.toes, fl, 2.1);
+      continue;
+    }
+    s += g(use(sid, { fill: F.limb }) + m + rimShade(ctx, d), { 'clip-path': ctx.clipUse(sid) }) + use(sid, { fill: 'none', stroke: F.limbLine, 'stroke-width': 2.7, 'stroke-linejoin': 'round' });
+  }
+  return s;
+}
+
+/* ---- toon.js ---- */
+/* ===== toon.js — reference-style anthro parts: head silhouette, face mask, big ears, plush tail,
+   fur "gloves" and "socks". Everything is flat colour + one dark ink line + a few hard shadow blocks. ===== */
+
+/* mirror a list of [x,y,flag] around the centre line */
+const mirList = pts => pts.map(p => [mirX(p[0]), p[1], p[2]]);
+
+/* ---------- head silhouettes (right half, top -> bottom) + the default tuft on top ---------- */
+/* Every head shares the same eye line (y 224), brow line, nose and chin (~y 290) so faces, hats and glasses fit all. */
+const TOON_HEADS = {
+  /* fox: traced from the reference at 0.48 scale */
+  fox: {
+    right: [[212, 120.5], [223.5, 122.7], [242, 132], [259.5, 145.8], [272, 157.3], [280.6, 168.8], [286.9, 180.3], [295, 189.4], [301.4, 199.5], [302.2, 205],
+      [298.8, 210.5], [297.4, 215], [300.2, 219.4], [305, 223.6], [316, 227.6], [324.3, 230.7, 1], [316.6, 236.6], [311.2, 242], [304.2, 247, 1], [311.6, 251],
+      [316.6, 253.3, 1], [309.6, 257], [301.8, 262.4, 1], [292.4, 266], [288.6, 270.4], [288.8, 279.2, 1], [282.8, 275.6, 1], [266.2, 276.8], [256.6, 280.6], [236, 285.4],
+      [215.8, 289.3], [200, 290.2]],
+    tuft: [[176, 126.4], [183.4, 124.4], [194, 118], [206.8, 112.4, 1], [202.6, 119.8, 1]],
+  },
+  /* wolf: like the fox but squarer, with long swept cheek tufts */
+  wolf: {
+    right: [[212, 120], [225, 122.5], [244, 131], [262, 144.5], [275, 156.5], [284, 168.5], [291, 180.5], [299, 191], [305, 202], [306.5, 208],
+      [303, 213], [305, 219], [319, 224], [336, 229, 1], [320, 236], [313, 243, 1], [326, 249], [333, 254, 1], [317, 258], [305, 264, 1], [312, 274, 1], [297, 273],
+      [287, 279], [267, 283], [247, 287], [226, 290], [210, 291.5], [200, 292]],
+    tuft: [[172, 127], [180, 120], [185, 108, 1], [192, 117, 1], [199, 104, 1], [203, 115, 1], [207, 118]],
+  },
+  /* tiger: big round head with a wide cheek ruff */
+  tiger: {
+    right: [[212, 117.5], [231, 120.5], [251, 129], [268, 141], [282, 155], [292, 171], [299, 189], [304, 207], [306, 215], [313, 221], [329, 227, 1], [317, 234],
+      [325, 243, 1], [313, 249], [321, 259, 1], [305, 262], [308, 273, 1], [293, 272], [283, 280], [263, 285], [241, 289.5], [219, 291.5], [200, 292]],
+    tuft: [[180, 121], [190, 116], [198, 108, 1], [203, 115, 1]],
+  },
+  /* cat: round face, two small cheek fluffs */
+  cat: {
+    right: [[212, 119], [228, 121.5], [247, 129.5], [264, 141], [278, 155], [288, 171], [295, 189], [299, 207], [301, 220], [308, 229], [319, 235, 1], [307, 241],
+      [313, 250, 1], [299, 256], [291, 266], [278, 276], [258, 283.5], [237, 288.5], [217, 291], [200, 291.5]],
+    tuft: [[181, 122], [190, 118], [196, 110, 1], [200, 117, 1], [205, 112, 1], [207, 119]],
+  },
+  /* bunny: soft round head and chubby cheeks */
+  bunny: {
+    right: [[212, 116.5], [230, 119.5], [250, 127.5], [268, 139.5], [282, 154.5], [291, 171.5], [297, 191], [300, 212], [300, 231], [299, 246], [305, 256, 1],
+      [294, 262], [285, 272], [270, 282], [251, 288], [231, 291.5], [213, 293], [200, 293.5]],
+    tuft: [[183, 120], [192, 114], [203, 110, 1], [201, 117]],
+  },
+  /* bear: wide round head, no spikes */
+  bear: {
+    right: [[212, 116], [232, 118.5], [254, 126], [272, 138], [286, 153], [296, 172], [302, 194], [305, 216], [304, 236], [300, 253], [290, 268], [276, 279],
+      [256, 287], [233, 291.5], [214, 293.5], [200, 294]],
+    tuft: [[186, 118], [196, 113], [205, 110, 1], [202, 116]],
+  },
+  /* deer: rounded head, one small cheek fluff */
+  deer: {
+    right: [[212, 118.5], [228, 121], [247, 129], [264, 141], [277, 155], [287, 171], [293, 189], [296, 207], [297, 222], [303, 232], [313, 239, 1], [301, 245],
+      [296, 255], [288, 267], [274, 277], [255, 284], [235, 289], [216, 291.5], [200, 292]],
+    tuft: [[184, 121], [194, 116], [204, 111, 1], [203, 118]],
+  },
+};
+/* ---------- fitting things to each species' head (hats, hair) ---------- */
+const headKindOf = st => TOON_HEADS[st.species] ? st.species : 'fox';
+/* x of the right side of the cranium at height y */
+function craniumX(kind, y) {
+  const R = TOON_HEADS[kind].right;
+  if (y <= R[0][1]) return R[0][0];
+  for (let i = 0; i < R.length - 1; i++) {
+    const a = R[i], b = R[i + 1];
+    if (a[1] <= y && b[1] >= y && b[1] > a[1]) return a[0] + (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]);
+  }
+  return R[R.length - 1][0];
+}
+/* cranium outline from the left side at y0, over the top, down to the right side at y0, pushed outwards by
+   t (a number, or t(k) with k = 0 at y0 and 1 at the crown, so a hat can be fuller on top) */
+function craniumArc(kind, y0, t) {
+  const R = TOON_HEADS[kind].right, top = R[0][1] - .8;
+  const right = [];
+  for (const p of R) { if (p[1] >= y0) break; right.push({ x: p[0], y: p[1] }); }
+  right.push({ x: craniumX(kind, y0), y: y0 });
+  const P = [...right.map(p => ({ x: 400 - p.x, y: p.y })).reverse(), { x: 200, y: top }, ...right];
+  const N = normals(P);
+  return P.map((p, i) => {
+    let nx = N[i].x, ny = N[i].y;
+    if (nx * (p.x - 200) + ny * (p.y - y0 - 30) < 0) { nx = -nx; ny = -ny; }
+    const k = clamp((y0 - p.y) / (y0 - top), 0, 1), d = typeof t === 'function' ? t(k) : t;
+    return [r1(p.x + nx * d), r1(p.y + ny * d)];
+  });
+}
+/* the skull without its cheek fluff: below the temples the head side is held at the temple width, then follows the jaw */
+function skullX(kind, y) {
+  const top = craniumX(kind, Math.min(y, 200));
+  return y <= 200 ? top : Math.min(craniumX(kind, y), top + 4);
+}
+
+function toonHeadPts(kind, tuft) {
+  const H = TOON_HEADS[kind] || TOON_HEADS.fox;
+  const R = H.right;
+  const left = mirList(R.slice(1, -1)).reverse();
+  return [...(tuft || H.tuft), ...R, ...left];
+}
+const TOON_CACHE = {};
+function toonHeadPath(kind, tuftId, tuft) {
+  const k = kind + ':' + (tuftId || '');
+  return TOON_CACHE[k] || (TOON_CACHE[k] = smooth(toonHeadPts(kind, tuft)));
+}
+
+/* face markings, drawn inside the head silhouette */
+const foxMask = [[200, 251], [207.6, 246.4], [211.4, 241], [217, 236.6], [223.4, 234.2], [238, 230], [262, 233], [266.6, 242.4], [274.4, 240.2], [282, 232, 1],
+  [287.6, 237.2], [298.6, 226.2], [303, 222.4], [340, 214], [340, 330], [200, 330]];
+/* cat / bunny muzzle: a small bump under the nose and the two wide whisker pads below it, where the mouth sits */
+const muzzlePuffs = (F, k = 1) => ell(200, 252, 15 * k, 11 * k, { fill: F.sub })
+  + ell(200 - 13 * k, 267, 16 * k, 12.5 * k, { fill: F.sub }) + ell(200 + 13 * k, 267, 16 * k, 12.5 * k, { fill: F.sub });
+const TOON_FACE = {
+  fox: (ctx, st, F) => path(S(foxMask), { fill: F.sub }),
+  wolf: (ctx, st, F) => path(S([[200, 252], [208, 246], [213, 239], [220, 235], [240, 232], [263, 235], [270, 243], [279, 240], [287, 233, 1], [293, 238], [303, 228], [340, 218],
+    [340, 330], [200, 330]]), { fill: F.sub })
+    + path(S([[200, 112], [214, 113], [222, 132], [214, 160], [206, 186], [200, 192]]), { fill: mix(F.main, F.acc, .45) }),
+  tiger: (ctx, st, F) => {
+    let m = path(S([[200, 250], [209, 244], [217, 237], [236, 233], [262, 236], [276, 246], [292, 236, 1], [304, 226], [340, 218], [340, 330], [200, 330]]), { fill: F.sub });
+    const a = F.acc;
+    m += path('M200,116L208,120L205,146L200,154L195,146L192,120Z', { fill: a });
+    for (const s of [-1, 1]) {
+      const X = x => CX + s * (x - CX);
+      m += path(`M${X(180)},122L${X(191)},127L${X(184)},146Z`, { fill: a }) + path(`M${X(162)},131L${X(178)},140L${X(165)},150Z`, { fill: a });
+      m += path(`M${X(306)},180L${X(276)},190L${X(304)},197Z`, { fill: a }) + path(`M${X(310)},202L${X(282)},208L${X(310)},214Z`, { fill: a });
+      m += path(`M${X(330)},244L${X(296)},252L${X(326)},258Z`, { fill: a }) + path(`M${X(322)},264L${X(290)},266L${X(312)},274Z`, { fill: a });
+    }
+    return m;
+  },
+  cat: (ctx, st, F) => {
+    const pal = st.fur, a = F.acc;
+    let m = '';
+    if (pal.points) m += ell(200, 252, 46, 36, { fill: a, opacity: .9 });
+    m += muzzlePuffs(F, pal.points ? .85 : 1);
+    if (pal.stripes) {
+      m += path('M200,118L205,121L203,146L200,152L197,146L195,121Z', { fill: a, opacity: .9 });
+      for (const s of [-1, 1]) {
+        const X = x => CX + s * (x - CX);
+        m += path(`M${X(184)},122L${X(191)},125L${X(189)},144L${X(185)},147Z`, { fill: a, opacity: .9 });
+        m += path(`M${X(302)},196L${X(278)},202L${X(302)},208Z`, { fill: a, opacity: .9 }) + path(`M${X(314)},232L${X(292)},238L${X(314)},244Z`, { fill: a, opacity: .9 });
+      }
+    }
+    return m;
+  },
+  bunny: (ctx, st, F) => muzzlePuffs(F, .92),
+  bear: (ctx, st, F) => {
+    const pal = st.fur;
+    let m = '';
+    if (pal.panda) for (const s of [-1, 1]) m += ell(CX + s * 47, 226, 31, 37, { fill: F.acc, transform: `rotate(${s * -24} ${CX + s * 47} 226)` });
+    return m + ell(200, 262, 39, 29, { fill: F.sub });
+  },
+  deer: (ctx, st, F) => {
+    const pal = st.fur;
+    let m = ell(200, 263, 33, 27, { fill: F.sub });
+    if (pal.spots) for (const [x, y, r] of [[160, 160, 4.4], [174, 146, 3.6], [146, 176, 3.4], [240, 160, 4.4], [226, 146, 3.6], [254, 176, 3.4]]) m += circ(x, y, r, { fill: lighten(F.sub, .3) });
+    return m;
+  },
+};
+
+function drawToonHead(ctx, st, F) {
+  const sp = SPECIES[st.species];
+  const kind = TOON_HEADS[st.species] ? st.species : 'fox';
+  const tuft = toonTuft(st, kind);
+  const d = toonHeadPath(kind, tuft.id, tuft.pts);
+  const sid = ctx.shape(d);
+  let m = TOON_FACE[kind] ? TOON_FACE[kind](ctx, st, F) : '';
+  // hard shadow along the jaw
+  m += path(S([[200, 276], [228, 274], [258, 270], [282, 260], [300, 254], [340, 262], [340, 330], [200, 330]]), shadowFill(.08));
+  let s = g(use(sid, { fill: F.main }) + m, { 'clip-path': ctx.clipUse(sid) });
+  s += use(sid, { fill: 'none', stroke: F.line, 'stroke-width': 2.7, 'stroke-linejoin': 'round' });
+  // little fur flicks on spiky cheeks; whiskers
+  if (['fox', 'wolf', 'tiger'].includes(kind)) s += ln('M276,248l14,3M124,248l-14,3', F.line, 1.6, { opacity: .5 });
+  if (sp.whiskers) {
+    const wc = isLight(F.sub) ? F.line : lighten(F.sub, .4);
+    let w = '';
+    for (const s2 of [-1, 1]) {
+      const X = x => CX + s2 * (x - CX);
+      w += `M${X(230)},257L${X(266)},250M${X(231)},263L${X(269)},264M${X(229)},269L${X(263)},278`;
+    }
+    s += ln(w, wc, 1.3, { opacity: .55 });
+  }
+  return s + (tuft.over ? tuft.over(ctx, st, F, sid) : '');
+}
+/* tuft on top of the head: the species default, or a fur-tuft style the player picked (see hair.js) */
+function toonTuft(st, kind) {
+  const hat = st.wear && st.wear.hat && ITEM_INDEX.hat[st.wear.hat.id];
+  if (hat && hat.covers) return { id: '_hat', pts: [], over: null };   // no top tuft under a hat
+  if (st.hair && HAIR_STYLES[st.hair.id]) return { id: '_hat', pts: [], over: null };   // the hairstyle covers the top of the head
+  return { id: '', pts: null, over: null };
+}
+
+/* ---------- ears (drawn in head coordinates; left ear = mirror) ---------- */
+const circlePts = (cx, cy, r, n = 16, a0 = 0) => Array.from({ length: n }, (_, i) => { const a = a0 + i / n * Math.PI * 2; return [cx + Math.cos(a) * r, cy + Math.sin(a) * r]; });
+const TOON_EARS = {
+  fox: {
+    outline: [[281.6, 55.6], [285.9, 53.6, 1], [290.6, 56.4], [296.5, 65.1], [300.8, 76.6], [304.6, 88.2], [308, 99.7], [310.4, 111.2], [312.3, 122.7], [313.8, 134.2],
+      [314.7, 145.8], [314.4, 157], [313.2, 167], [310.6, 178], [306, 194], [292, 206], [262, 196], [238, 160], [230.2, 117], [233.1, 111.2], [236.5, 105.4],
+      [240.3, 99.7], [244.2, 94], [248.5, 88.2], [253.3, 82.4], [258.1, 76.6], [264.3, 70.9], [271, 65.1], [276.6, 59.6]],
+    cap: [[214, 92], [242.8, 97], [264.6, 105.4], [280, 112], [296, 128], [303, 136], [312, 140], [340, 146], [340, 0], [214, 0]],
+    inner: [[287.4, 75.4, 1], [291.6, 88], [295.8, 105.4], [299, 122], [300.6, 141.4], [300.5, 160], [299.4, 175], [296, 195], [270, 200], [252.3, 140], [254.2, 134.2],
+      [257.6, 122.7], [262.4, 111.2], [268.2, 99.7], [275.4, 88.2], [284, 76.6]],
+    fold: [[285.6, 76], [279.7, 82.4], [275.4, 88.2], [271.5, 94], [268.2, 99.7], [265.3, 105.4], [262.4, 111.2], [260, 117], [257.6, 122.7], [255.7, 128.5], [254.2, 134.2], [252.3, 140]],
+    fluff: [[288.4, 100], [276.6, 109, 1], [280.2, 117.4, 1], [274.2, 125.8, 1], [283.8, 134.3, 1], [279.4, 146.2, 1], [289.8, 153.4, 1], [286.4, 165.4, 1], [294.6, 172.6]],
+    pivot: [266, 160], scale: 1.06,
+  },
+  wolf: {
+    outline: [[268, 60], [272.5, 57, 1], [277, 61], [287, 80], [296, 103], [303, 128], [307, 152], [305, 175], [292, 192], [264, 183], [244, 152], [240, 126], [247, 103], [257, 81]],
+    cap: [[226, 90], [256, 94], [274, 102], [287, 113], [299, 132], [311, 142], [340, 148], [340, 0], [226, 0]],
+    inner: [[272, 76, 1], [280, 96], [287, 119], [292, 143], [293, 166], [286, 184], [268, 182], [255, 151], [255, 124], [262, 99]],
+    fold: [[271, 78], [264, 96], [258, 117], [255, 140]],
+    fluff: [[284, 112], [274, 122, 1], [279, 131, 1], [272, 141, 1], [282, 150, 1], [277, 162, 1], [287, 170]],
+    pivot: [270, 160], scale: 1.04,
+  },
+  tiger: {
+    outline: [[248, 150], [252, 124], [261, 105], [276, 94], [293, 93], [306, 102], [313, 119], [312, 141], [303, 162], [282, 172], [260, 166]],
+    cap: [[236, 128], [256, 100], [278, 86], [300, 88], [318, 104], [326, 132], [340, 140], [340, 0], [236, 0]],
+    inner: [[262, 150], [266, 128], [275, 113], [288, 108], [299, 115], [302, 130], [299, 148], [287, 160], [271, 158]],
+    fluff: [[296, 124], [286, 132, 1], [292, 139, 1], [282, 146, 1], [291, 153]],
+    pivot: [276, 150], scale: 1,
+  },
+  cat: {
+    outline: [[236, 152], [242, 125], [252, 101], [264, 81], [273, 66, 1], [282, 82], [291, 105], [298, 131], [302, 158], [295, 178], [268, 170], [247, 162]],
+    inner: [[250, 150], [256, 125], [264, 105], [272, 88, 1], [279, 106], [286, 130], [290, 156], [281, 168], [261, 162]],
+    fluff: [[256, 150], [266, 140, 1], [261, 131, 1], [271, 124, 1], [267, 115]],
+    pivot: [268, 160], scale: 1,
+  },
+  bunny: {
+    outline: [[222, 152], [219, 112], [220, 74], [226, 42], [236, 20], [249, 12], [261, 20], [268, 42], [271, 75], [269, 112], [263, 148], [246, 162]],
+    inner: [[233, 148], [231, 112], [232, 78], [237, 49], [244, 31], [251, 29], [256, 46], [258, 78], [257, 112], [252, 146]],
+    pivot: [244, 150], scale: 1,
+  },
+  bear: {
+    outline: circlePts(278, 126, 27, 18), inner: circlePts(280, 130, 15.5, 14),
+    pivot: [278, 140], scale: 1, round: true,
+  },
+  deer: {
+    outline: [[286, 182], [299, 169], [317, 162], [335, 163], [350, 171, 1], [335, 187], [316, 196], [298, 198]],
+    inner: [[297, 182], [311, 174], [327, 171], [341, 174, 1], [328, 183], [313, 189], [299, 189]],
+    pivot: [296, 186], scale: 1,
+  },
+};
+function drawToonEars(ctx, st, F) {
+  const sp = SPECIES[st.species], pal = st.fur;
+  const key = TOON_EARS[st.species] ? st.species : 'fox';
+  const E = TOON_EARS[key];
+  const sid = ctx.shape(smooth(E.outline));
+  const lc = F.line;
+  const earCol = pal.panda || pal.points ? F.acc : F.main;
+  const innerCol = pal.panda ? lighten(F.acc, .14) : F.inner;
+  let inner = E.cap ? path(poly(E.cap) + 'Z', { fill: F.acc }) : '';
+  inner += path(smooth(E.inner), { fill: innerCol });
+  if (E.fluff) inner += ln(smooth(E.fluff, false), isLight(innerCol) ? mix(innerCol, INK, .42) : lighten(innerCol, .35), 1.5, { opacity: .8 });
+  if (E.fold) inner += ln(smooth(E.fold, false), lc, 2);
+  const [px, py] = E.pivot, k = E.scale || 1;
+  const one = g(use(sid, { fill: earCol }) + g(inner, { 'clip-path': ctx.clipUse(sid) }) + use(sid, { fill: 'none', stroke: lineOf(earCol), 'stroke-width': 2.7, 'stroke-linejoin': 'round' }),
+    { transform: `translate(${px},${py}) scale(${k}) translate(${-px},${-py})` });
+  let s = g(one, { class: 'ear earR', style: `transform-origin:${px}px ${py}px` })
+    + g(g(one, { transform: `translate(${2 * CX},0) scale(-1,1)` }), { class: 'ear earL', style: `transform-origin:${mirX(px)}px ${py}px` });
+  if (sp.antlers) s = toonAntlers(F) + s;
+  return s;
+}
+/* small branched antlers that sit behind the head */
+function toonAntlers(F) {
+  const c = F.antler, lc = lineOf(c);
+  const one = s2 => {
+    const X = x => CX + s2 * (x - CX);
+    const d = `M${X(230)},132C${X(234)},106 ${X(242)},86 ${X(250)},62M${X(240)},96C${X(252)},94 ${X(262)},86 ${X(270)},74M${X(246)},76C${X(240)},68 ${X(236)},60 ${X(233)},50`;
+    return ln(d, lc, 11.5) + ln(d, c, 7) + ln(`M${X(233)},120C${X(237)},104 ${X(242)},90 ${X(247)},74`, lighten(c, .5), 1.6, { opacity: .8 });
+  };
+  return one(-1) + one(1);
+}
+
+/* ---------- plush tail with a layered cream tip (silhouette traced from the reference) ---------- */
+const TOON_TAILS = {
+  /* traced from the outfit reference (ref3): teardrop leaning right, tip up at elbow height */
+  fox: {
+    shape: [[-64.5, -73.2, 1], [-77.6, -60.1], [-92, -49], [-101.3, -41.7], [-106.6, -39.4, 1], [-108.2, -34.6, 1], [-116, -27], [-122.4, -15.3], [-127.7, 8.5], [-126.4, 32.2],
+      [-117.1, 55.9], [-101.3, 74.2], [-88.6, 83, 1], [-84.2, 81.4, 1], [-72, 89.4], [-59.2, 92.7], [-32.9, 90], [-14.4, 84.8], [9, 58], [14, 8], [-6, -22],
+      [-44, -26], [-51.3, -31.2], [-56.6, -39.1], [-60.4, -50], [-62.4, -62]],
+    cream: [[-150, 30, 1], [-130.3, 26.8, 1], [-104.5, 12.6, 1], [-98.7, 40, 1], [-77.1, -5.2, 1], [-69.2, 21.6, 1], [-51.3, -10, 1], [-30, -14, 1], [-20, -120], [-150, -120]],
+    tufts: [],
+    shade: [[-150, 74], [-90.8, 69, 1], [-69.7, 53.2, 1], [-59.2, 69, 1], [-38.1, 48, 1], [-27.6, 59, 1], [20, 50], [20, 140], [-150, 140]],
+  },
+  /* wolf: bushy brush held low, curling out at the dark tip */
+  wolf: {
+    shape: [[12, -14], [-14, -18], [-40, -10], [-64, 8], [-82, 30], [-88, 38, 1], [-86, 44, 1], [-97, 62], [-104, 88], [-103, 104, 1], [-99, 110, 1], [-100, 128],
+      [-95, 146], [-86, 163], [-76, 178, 1], [-70, 160], [-60, 138], [-56, 132, 1], [-50, 128, 1], [-42, 106], [-28, 80], [-12, 54], [2, 32], [16, 12]],
+    tip: [[-140, 118, 1], [-104, 114, 1], [-97, 136, 1], [-86, 112, 1], [-77, 134, 1], [-67, 114, 1], [-58, 136, 1], [-30, 128, 1], [-30, 220], [-140, 220]],
+    shade: [[0, 40], [-14, 62, 1], [-30, 80], [-30, 94, 1], [-44, 108], [-52, 124, 1], [-20, 140], [40, 140], [40, 20]],
+  },
+};
+function drawToonTail(ctx, st, F, A) {
+  const sp = SPECIES[st.species];
+  const T = TOON_TAILS[sp.tail] || TOON_TAILS.fox;
+  const sid = ctx.shape(smooth(T.shape));
+  let m = path(poly(T.shade) + 'Z', shadowFill(.15));
+  if (T.cream) m += path(poly(T.cream) + 'Z', { fill: F.sub });
+  if (T.tip) m += path(poly(T.tip) + 'Z', { fill: mix(F.main, F.acc, .65) });
+  for (const t of T.tufts || []) m += path(smooth(t), { fill: F.sub });
+  let s = g(use(sid, { fill: F.main }) + m, { 'clip-path': ctx.clipUse(sid) });
+  s += use(sid, { fill: 'none', stroke: F.line, 'stroke-width': 2.7, 'stroke-linejoin': 'round' });
+  return g(g(s, { transform: `translate(${A.x},${A.y})` }), { class: 'tail', style: `transform-origin:${A.x}px ${A.y}px` });
+}
+
+/* ---------- long thin tails (cat, tiger): S-curve rising beside the body, rings drawn as chevron bands ---------- */
+function drawToonLongTail(ctx, st, F, A) {
+  const sp = SPECIES[st.species], pal = st.fur;
+  const tiger = sp.tail === 'tiger';
+  const w = tiger ? 11.5 : 10;
+  const spn = sampleBezier({ x: 2, y: 4 }, { x: -78, y: 44 }, { x: -132, y: -12 }, { x: -112, y: -104 }, 40);
+  const wf = t => t < .1 ? lerp(w * .8, w, t / .1) : t > .86 ? w * Math.sqrt(Math.max(0, 1 - Math.pow((t - .86) / .14, 2))) * .9 + w * .1 : w;
+  const d = tube(spn, wf, 'round', 'round');
+  const sid = ctx.shape(d);
+  const N = normals(spn), n = spn.length - 1;
+  // band across the tail from t0 to t1, its edges bent into a shallow chevron pointing at the root
+  const band = (t0, t1) => {
+    const i0 = Math.round(t0 * n), i1 = Math.min(n, Math.round(t1 * n));
+    const edge = (i, k) => { const W = w + 6; return [[spn[i].x + N[i].x * W, spn[i].y + N[i].y * W], [spn[i].x - N[i].tx * k, spn[i].y - N[i].ty * k], [spn[i].x - N[i].x * W, spn[i].y - N[i].y * W]]; };
+    const a = edge(i0, 4), b = i1 >= n ? [[spn[n].x + N[n].x * 30 + N[n].tx * 30, spn[n].y + N[n].y * 30 + N[n].ty * 30], [spn[n].x - N[n].x * 30 + N[n].tx * 30, spn[n].y - N[n].y * 30 + N[n].ty * 30]] : edge(i1, 4).reverse();
+    return poly([...a, ...b]) + 'Z';
+  };
+  let m = '';
+  // hard shadow on the inner side
+  const sh = [];
+  for (let i = 0; i <= n; i++) sh.push([spn[i].x - N[i].x * w * .35, spn[i].y - N[i].y * w * .35]);
+  for (let i = n; i >= 0; i--) sh.push([spn[i].x - N[i].x * (w + 8), spn[i].y - N[i].y * (w + 8)]);
+  m += path(poly(sh) + 'Z', shadowFill(.13));
+  if (tiger) { for (const t of [.2, .34, .48, .62, .74]) m += path(band(t, t + .055), { fill: F.acc }); m += path(band(.86, 1), { fill: F.acc }); }
+  else if (pal.points) m += path(band(.5, 1), { fill: F.acc });
+  else if (pal.stripes) for (const t of [.3, .48, .66, .84]) m += path(band(t, t + .07), { fill: F.acc, opacity: .9 });
+  let s = g(use(sid, { fill: F.main }) + m, { 'clip-path': ctx.clipUse(sid) }) + use(sid, { fill: 'none', stroke: F.line, 'stroke-width': 2.7, 'stroke-linejoin': 'round' });
+  return g(g(s, { transform: `translate(${A.x},${A.y})` }), { class: 'tail', style: `transform-origin:${A.x}px ${A.y}px` });
+}
+
+/* ---------- fur gloves / socks with a zigzag edge ---------- */
+function armUpperD(arm, K, a, wf) {
+  const T = armTube(arm, K, 0, a, t => wf(t) + 4, 'round', 'flat');
+  const sp = T.sp, N = normals(sp), n = sp.length;
+  const left = [], right = [];
+  for (let i = 0; i < n; i++) { const w = T.width(i / (n - 1)); left.push([sp[i].x + N[i].x * w, sp[i].y + N[i].y * w]); right.push([sp[i].x - N[i].x * w, sp[i].y - N[i].y * w]); }
+  // fur teeth pointing down the arm: 3 full teeth spanning exactly the arm, plus overshoot past the outline
+  const e = sp[n - 1], Ne = N[n - 1], we = T.width(1), wa = wf(a / arm.len), teeth = 4, depth = 7, zig = [];
+  zig.push([e.x + Ne.x * we, e.y + Ne.y * we]);
+  for (let k = 0; k <= teeth * 2; k++) {
+    const off = lerp(wa, -wa, k / (teeth * 2)), fwd = k % 2 ? depth : 0;
+    zig.push([e.x + Ne.x * off + Ne.tx * fwd, e.y + Ne.y * off + Ne.ty * fwd]);
+  }
+  zig.push([e.x - Ne.x * we, e.y - Ne.y * we]);
+  const w0 = T.width(0), n0 = N[0], cap = [];
+  for (let k = 1; k < 6; k++) { const q = Math.PI * k / 6; cap.push([sp[0].x - n0.x * w0 * Math.cos(q) - n0.tx * w0 * Math.sin(q), sp[0].y - n0.y * w0 * Math.cos(q) - n0.ty * w0 * Math.sin(q)]); }
+  return poly([...left, ...zig, ...right.reverse(), ...cap]) + 'Z';
+}
+function sockD(K, s, y0) {
+  const X = dx => CX + s * dx;
+  const e = legEdgeAt(K, y0, 2);
+  const pts = [];
+  const teeth = 3, depth = 9;
+  for (let k = 0; k <= teeth * 2; k++) {
+    const f = k / (teeth * 2);
+    pts.push([X(lerp(e.i - 2, e.o, f)), y0 - (k % 2 ? depth : 0)]);
+  }
+  return poly([...pts, [X(e.o + 30), y0], [X(e.o + 30), 760], [X(e.i - 30), 760], [X(e.i - 30), y0]]) + 'Z';
+}
+
+/* ---- face.js ---- */
+/* ===== face.js — eyes, brow spots, nose, mouth, blush ===== */
+const EYE_STYLES = [
+  { id: 'sparkle', name: '圆圆眼' },
+  { id: 'boy', name: '少年' },
+  { id: 'round', name: '豆豆眼' },
+  { id: 'cat', name: '猫瞳' },
+  { id: 'star', name: '星星眼' },
+  { id: 'heart', name: '爱心眼' },
+  { id: 'sleepy', name: '慵懒' },
+  { id: 'happy', name: '眯眯眼' },
+];
+const EYE_COLORS = ['#43a4e5', '#4fc3f7', '#23928a', '#62b83f', '#c9a227', '#e9a23b', '#8a5a2a', '#e2577f', '#b07cff', '#7b5cf0', '#ff5b5b', '#3a3346'];
+const EXPRESSIONS = [
+  { id: 'smile', name: '微笑', mouth: 'smile', brow: 'soft', blush: 0 },
+  { id: 'grin', name: '开心', mouth: 'grin', brow: 'up', blush: 1 },
+  { id: 'fang', name: '得意', mouth: 'fang', brow: 'soft', blush: 0 },
+  { id: 'shy', name: '害羞', mouth: 'shy', brow: 'worry', blush: 2 },
+  { id: 'cool', name: '酷', mouth: 'smirk', brow: 'sharp', blush: 0 },
+  { id: 'wow', name: '惊讶', mouth: 'o', brow: 'high', blush: 0 },
+  { id: 'tongue', name: '调皮', mouth: 'tongue', brow: 'up', blush: 1 },
+  { id: 'pout', name: '嘟嘴', mouth: 'pout', brow: 'worry', blush: 1 },
+];
+const EYE_C = { L: [152.5, 224], R: [247.5, 224] };
+const INK = '#2c1418';
+
+function drawEyes(ctx, st, F) {
+  const style = st.eyes.style, col = st.eyes.color;
+  return eyeOne(ctx, style, col, -1, F) + eyeOne(ctx, style, col, 1, F);
+}
+/* Eye in the reference style: tall rounded opening, iris pushed toward the nose,
+   heavy upper lid with a small outer flick, thin full outline, one big highlight.
+   Local coords: +x = outward (away from the nose), +y = down. */
+function eyeOne(ctx, style, col, side, F) {
+  const [ex, ey] = side > 0 ? EYE_C.R : EYE_C.L;
+  const X = x => r1(ex + x * side), Yy = y => r1(ey + y);
+  const P = pts => pts.map(p => [ex + p[0] * side, ey + p[1], p[2]]);
+  const ink = INK;
+  let s = '';
+  if (style === 'happy') {
+    s += ln(`M${X(-19)},${Yy(6)}Q${X(0)},${Yy(-15)} ${X(20)},${Yy(5)}`, ink, 5.4);
+    s += ln(`M${X(20)},${Yy(5)}L${X(26)},${Yy(1)}`, ink, 3.2);
+    return g(s, { class: 'eye' });
+  }
+  if (style === 'round') {
+    s += ell(ex - 2 * side, ey + 4, 12.5, 15, { fill: ink });
+    s += ell(ex - 5 * side, ey - 2, 4.6, 5.6, { fill: '#fff' }) + circ(ex + 2 * side, ey + 10, 2.2, { fill: '#fff' });
+    return g(s, { class: 'eye' });
+  }
+  const boy = style === 'boy';
+  const k = boy ? .86 : 1;                          // boys: a bit shorter, flatter lid
+  const sy = y => y < 0 ? y * k : y * (boy ? .9 : 1);
+  const open = [[22.5, -19.5], [1.5, -24.5], [-20.5, -18], [-22.8, 1.5], [-15, 20.5], [0, 24.5], [15, 18], [22, -1]].map(p => [p[0], sy(p[1])]);
+  const scId = ctx.shape(smooth(P(open)));
+  const clip = ctx.clipUse(scId);
+  const dark = darken(col, .55), mid = darken(col, .18), light = lighten(col, .35);
+  const gid = ctx.def('iris2-' + col.slice(1), `<linearGradient id="__ID__" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="${dark}"/><stop offset=".46" stop-color="${dark}"/><stop offset=".46" stop-color="${mid}"/><stop offset=".62" stop-color="${col}"/><stop offset="1" stop-color="${light}"/></linearGradient>`);
+  const icx = ex - 7 * side, icy = ey + (boy ? 1.5 : 1);
+  const irx = boy ? 13.8 : 15, iry = boy ? 19.5 : 23;
+  let iris = ell(icx, icy, irx, iry, { fill: `url(#${gid})`, stroke: darken(col, .7), 'stroke-width': 1.3 });
+  const pcx = ex - 9 * side, pcy = ey - 1;
+  const pupil = darken(col, .74);
+  if (style === 'cat') iris += path(`M${r1(pcx)},${r1(pcy - 15)}Q${r1(pcx + 4.6)},${r1(pcy)} ${r1(pcx)},${r1(pcy + 15)}Q${r1(pcx - 4.6)},${r1(pcy)} ${r1(pcx)},${r1(pcy - 15)}Z`, { fill: pupil });
+  else if (style === 'heart') iris += path(heartD(pcx, pcy + 1, 8.5), { fill: '#fff', opacity: .95 });
+  else if (style === 'star') iris += path(starD(pcx, pcy + 1, 11, .45), { fill: '#fff' });
+  else iris += ell(pcx, pcy, boy ? 5.2 : 5.8, boy ? 10.5 : 12.5, { fill: pupil });
+  // highlights sit toward the nose, like the reference
+  if (style !== 'heart' && style !== 'star') iris += circ(ex - 12 * side, ey - (boy ? 8 : 10), boy ? 3.2 : 3.8, { fill: '#fff' });
+  if (style === 'star') iris += path(starD(ex - 12 * side, ey - 11, 3.2, .4, 4), { fill: '#fff' });
+  if (style === 'cat' || style === 'sparkle') iris += circ(ex - 3 * side, ey + 13, 1.5, { fill: '#fff', opacity: .85 });
+  // lid shadow on the white of the eye
+  let shade = path(smooth(P([[30, -40], [-30, -40], [-30, sy(-13)], [-12, sy(-19)], [6, sy(-19.5)], [30, sy(-12)]])), { fill: '#6b3a4a', opacity: .16 });
+  if (style === 'sleepy') shade = path(`M${X(-32)},${Yy(-34)}L${X(32)},${Yy(-34)}L${X(32)},${Yy(-2)}Q${X(0)},${Yy(-7)} ${X(-32)},${Yy(-1)}Z`, { fill: F.main });
+  s += use(scId, { fill: '#fffdfa' }) + g(iris + shade, { 'clip-path': clip });
+  s += use(scId, { fill: 'none', stroke: ink, 'stroke-width': 1.7, 'stroke-linejoin': 'round' });
+  // heavy upper lid (filled crescent) with the outer flick
+  const ld = style === 'sleepy' ? 15 : 0;
+  const lid = boy
+    ? [[-22, -16.5], [-12, -21], [1.5, -23], [16, -20], [24.5, -17.5], [30.5, -16, 1], [24, -14.8], [16, -16.4], [1.5, -19], [-11, -17.5], [-21.5, -14.5, 1]]
+    : [[-22, -18.5], [-11, -25.5], [1.5, -28], [16, -25], [25.5, -21.5], [32, -19.5, 1], [24.5, -17.5], [16, -20.5], [1.5, -23.5], [-10, -22], [-21, -16.5, 1]];
+  s += path(smooth(P(lid.map(p => [p[0], p[1] + ld * (p[1] < -10 ? 1 : 0), p[2]]))), { fill: ink });
+  // soft crease above the inner half of the lid
+  if (!boy && style !== 'sleepy') s += ln(`M${X(-6)},${Yy(-32.5)}Q${X(-16)},${Yy(-31)} ${X(-21)},${Yy(-24)}`, ink, 1.5, { opacity: .55 });
+  return g(g(s, { transform: `translate(${ex},${ey}) scale(1.15,1.12) translate(${-ex},${-ey})` }), { class: 'eye' });
+}
+function heartD(x, y, s) {
+  return `M${r1(x)},${r1(y + s * .95)}C${r1(x - s * 1.7)},${r1(y - s * .15)} ${r1(x - s * .75)},${r1(y - s * 1.35)} ${r1(x)},${r1(y - s * .35)}C${r1(x + s * .75)},${r1(y - s * 1.35)} ${r1(x + s * 1.7)},${r1(y - s * .15)} ${r1(x)},${r1(y + s * .95)}Z`;
+}
+function starD(x, y, r, inner = .45, n = 5) {
+  let d = '';
+  for (let i = 0; i < n * 2; i++) { const a = -Math.PI / 2 + i * Math.PI / n, rr = i % 2 ? r * inner : r; d += (i ? 'L' : 'M') + r1(x + Math.cos(a) * rr) + ',' + r1(y + Math.sin(a) * rr); }
+  return d + 'Z';
+}
+
+/* brows are soft fur spots (like the reference), tilted by expression */
+function drawBrows(st, F) {
+  const ex = EXPRESSIONS.find(e => e.id === st.expr) || EXPRESSIONS[0];
+  const lumGap = Math.abs(toHsl(F.sub)[2] - toHsl(F.main)[2]);
+  const c = lumGap > .08 ? F.sub : shadeOf(F.main, .16);
+  let tilt = 12, dy = 0;
+  if (ex.brow === 'up') { dy = -3; tilt = 14; }
+  if (ex.brow === 'high') { dy = -7; tilt = 6; }
+  if (ex.brow === 'sharp') { tilt = -14; dy = 3; }
+  if (ex.brow === 'worry') { tilt = 26; dy = -1; }
+  const one = side => {
+    const [x0, y0] = side > 0 ? EYE_C.R : EYE_C.L;
+    const cx = x0 - 6 * side, cy = y0 - 48 + dy;
+    // leaf-like spot, fuller at the inner end
+    const d = 'M-13,1.5C-11,-4.5 -2,-7 6,-6.2C12,-5.6 14.5,-1.5 13,2.4C11,6.6 2,7 -4,5.6C-9,4.6 -13.6,4.4 -13,1.5Z';
+    return path(d, { fill: c, transform: `translate(${r1(cx)},${r1(cy)}) rotate(${tilt * side}) scale(${-side},1)` });
+  };
+  return one(-1) + one(1);
+}
+
+function noseInfo(st) {
+  const sp = SPECIES[st.species];
+  return sp.nose === 'big' ? { d: `M187,246Q200,240 213,246Q213,253 206,258Q200,262 194,258Q187,253 187,246Z`, my: 260, hx: 195, hy: 246 }
+    : sp.nose === 'pink' ? { d: `M193,247Q200,244.5 207,247Q206.5,252 200,255Q193.5,252 193,247Z`, my: 255, hx: 197, hy: 247.5 }
+      : { d: `M191.5,245Q200,242 208.5,245Q210,247.5 206.5,251.2Q202.4,255.6 200,255.6Q197.6,255.6 193.5,251.2Q190,247.5 191.5,245Z`, my: 255.5, hx: 196.4, hy: 246.2 };
+}
+function drawMouth(st, F) {
+  const sp = SPECIES[st.species];
+  const ex = EXPRESSIONS.find(e => e.id === st.expr) || EXPRESSIONS[0];
+  const N = noseInfo(st), my = N.my;
+  const lc = INK;
+  let s = '';
+  const c = my + 6;     // centre cusp of the ω
+  const omega = `M183,${c - .5}Q186.5,${c + 7} 191.5,${c + 7}Q197,${c + 7} 200,${c}Q203,${c + 7} 208.5,${c + 7}Q213.5,${c + 7} 217,${c - .5}`;
+  const MOUTH_IN = '#7d2b45';
+  switch (ex.mouth) {
+    case 'smile': s += ln(omega, lc, 2.4);
+      if (sp.teeth) s += path(`M195.6,${c + 5.2}h4.2v4.6q0,2 -2.1,2q-2.1,0 -2.1,-2zM200.2,${c + 5.2}h4.2v4.6q0,2 -2.1,2q-2.1,0 -2.1,-2z`, { fill: '#fff', stroke: lc, 'stroke-width': 1.1, 'stroke-linejoin': 'round' });
+      break;
+    case 'grin':
+      s += path(`M185,${c - 1}Q192,${c + 5} 200,${c}Q208,${c + 5} 215,${c - 1}Q213,${c + 16} 200,${c + 18}Q187,${c + 16} 185,${c - 1}Z`, { fill: MOUTH_IN, stroke: lc, 'stroke-width': 2.2, 'stroke-linejoin': 'round' });
+      s += path(`M191,${c + 13}Q200,${c + 6.5} 209,${c + 13}Q205,${c + 17.4} 200,${c + 17.4}Q195,${c + 17.4} 191,${c + 13}Z`, { fill: '#ff8aa5' });
+      if (sp.teeth) s += path(`M196,${c + 1.6}h3.8v4.2h-3.8zM200.2,${c + 1.6}h3.8v4.2h-3.8z`, { fill: '#fff' });
+      break;
+    case 'fang': s += ln(omega, lc, 2.4) + path(`M204.4,${c + 5.6}L209.4,${c + 6.2}L206.6,${c + 11.6}Z`, { fill: '#fff', stroke: lc, 'stroke-width': 1.1, 'stroke-linejoin': 'round' }); break;
+    case 'shy': s += ln(`M189,${c + 3}Q191.6,${c} 194.4,${c + 3}Q197.2,${c + 6} 200,${c + 3}Q202.8,${c} 205.6,${c + 3}Q208.4,${c + 6} 211,${c + 3}`, lc, 2.2); break;
+    case 'smirk': s += ln(`M186,${c + 3}Q193,${c + 7} 200,${c + 2}Q206,${c + 6} 214,${c - 3}`, lc, 2.4); break;
+    case 'o': s += ell(200, c + 6, 5, 6.2, { fill: MOUTH_IN, stroke: lc, 'stroke-width': 2 }); break;
+    case 'tongue': {
+      // hangs from the right lobe of the ω: its top edge is that lobe (the mouth line covers it), only the hanging part is outlined
+      const hang = `M213.1,${c + 5.1}Q213.6,${c + 15} 208.4,${c + 16}Q203.3,${c + 16} 203.6,${c + 5.25}`;
+      s += path(`M203.6,${c + 5.25}Q205.75,${c + 7} 208.5,${c + 7}Q211,${c + 7} 213.1,${c + 5.1}` + hang.replace('M', 'L') + 'Z', { fill: '#ff8aa5' })
+        + ln(hang, lc, 1.7) + ln(`M208.4,${c + 8.5}L208.6,${c + 12.5}`, '#e05a7d', 1.3) + ln(omega, lc, 2.4);
+      break;
+    }
+    case 'pout': s += ln(`M197,${c}Q203.5,${c + 1} 200,${c + 4}Q203.5,${c + 7} 197,${c + 8}`, lc, 2.4); break;
+  }
+  return s;
+}
+function drawNose(st, F) {
+  const N = noseInfo(st);
+  const c = st.fur.nose || '#532521';
+  return path(N.d, { fill: c, stroke: INK, 'stroke-width': 1.6, 'stroke-linejoin': 'round' }) + ell(N.hx, N.hy + .6, 2.6, 1.3, { fill: '#fff', opacity: .55 });
+}
+function drawBlush(ctx, st) {
+  const ex = EXPRESSIONS.find(e => e.id === st.expr) || EXPRESSIONS[0];
+  if (!ex.blush) return '';
+  const gid = ctx.def('blush', `<radialGradient id="__ID__"><stop offset="0" stop-color="#ff6f9a" stop-opacity=".5"/><stop offset="1" stop-color="#ff6f9a" stop-opacity="0"/></radialGradient>`);
+  let s = ell(146, 256, 15, 8, { fill: `url(#${gid})` }) + ell(254, 256, 15, 8, { fill: `url(#${gid})` });
+  if (ex.blush > 1) {
+    s += ell(146, 256, 14, 7, { fill: `url(#${gid})` }) + ell(254, 256, 14, 7, { fill: `url(#${gid})` });
+    for (const x of [138, 146, 154, 246, 254, 262]) s += ln(`M${x + 2},251L${x - 2},260`, '#f0507d', 1.6, { opacity: .8 });
+  }
+  return s;
+}
+
+/* ---- hair_data.js ---- */
+/* ===== hair_data.js — hairstyle shapes traced from the hairstyle reference sheets (fox head coordinates).
+   Generated by tools/gen_hair_data.py from tools/trace/*.json; edit the tracing, not this file. ===== */
+const HAIR_TRACE = {"curtain":{"outer":[[[339.0,202.0],[324.5,202.0],[314.0,197.5],[308.0,192.5],[321.5,190.5],[327.5,187.0],[331.0,184.0],[331.0,181.0],[324.5,180.5],[317.5,177.5],[305.5,167.0],[298.0,156.0],[285.0,131.5],[275.5,118.5],[269.5,112.5],[261.5,106.5],[247.5,101.0],[231.5,101.0],[223.5,104.5],[219.5,97.0],[210.0,89.0],[203.5,86.0],[193.5,85.0],[193.5,87.5],[199.5,94.5],[199.0,95.5],[194.0,93.0],[186.0,91.0],[170.0,91.0],[159.0,93.5],[146.0,100.0],[135.0,108.0],[121.5,123.0],[104.5,149.0],[92.5,161.5],[80.5,168.0],[75.0,169.5],[60.0,168.0],[61.5,173.5],[67.5,182.0],[73.5,186.5],[81.5,190.0],[69.5,191.5],[65.5,192.5],[58.5,197.5],[54.5,204.0],[54.0,215.5],[56.5,222.5],[60.0,223.0],[61.5,217.0],[67.5,211.5],[73.0,209.5],[78.5,209.5],[100.0,215.0],[113.5,215.0],[130.0,211.0],[132.0,208.0],[136.5,207.5],[145.5,203.0],[160.5,189.0],[160.5,188.0],[168.5,179.0],[178.0,161.5],[189.0,135.5],[194.0,129.5],[197.0,128.0],[201.0,130.5],[205.5,135.0],[211.0,145.0],[212.0,150.5],[215.0,150.5],[218.5,144.5],[225.5,137.5],[229.5,135.5],[233.0,135.5],[237.0,139.0],[241.0,146.0],[250.0,178.5],[258.0,197.5],[263.5,205.5],[273.0,215.0],[287.0,223.0],[298.0,226.0],[315.0,225.0],[321.0,223.0],[329.0,218.5],[336.5,210.0],[339.0,205.5]]],"shadows":[[[71.5,204.0],[66.0,203.5],[60.0,206.0],[56.5,211.0],[57.5,213.5],[62.0,214.5],[71.0,209.5]],[[260.5,197.5],[264.0,205.0],[273.5,214.5],[294.5,224.5],[314.0,224.5],[324.5,220.5],[332.0,213.0],[329.5,209.5],[316.0,213.0],[300.0,213.0],[285.0,207.5],[267.5,194.0],[263.5,194.0]],[[142.5,200.5],[138.0,194.5],[132.5,194.0],[115.0,199.5],[114.0,203.0],[124.5,209.5],[136.0,207.0]],[[300.5,182.0],[301.5,187.0],[306.0,190.5],[317.5,190.0],[317.5,186.0],[306.0,181.0]],[[127.0,172.5],[125.0,169.5],[121.0,169.5],[102.5,179.0],[92.0,181.0],[73.5,179.0],[71.5,182.5],[74.0,186.0],[82.5,189.0],[103.5,190.5],[120.5,179.5]],[[220.0,101.0],[216.5,101.0],[213.0,104.5],[206.5,103.0],[203.0,106.0],[205.0,114.0],[212.0,123.0],[220.0,121.5],[224.5,114.0],[225.5,110.0]]]},"swirl":{"outer":[[[303.0,227.5],[304.0,229.0],[318.0,238.0],[319.0,237.5],[322.0,234.5],[322.0,232.5],[321.0,231.5],[313.0,229.5],[306.5,225.5],[305.0,225.5]],[[69.5,189.5],[69.5,193.0],[70.5,197.0],[70.5,199.0],[74.0,208.5],[78.0,214.0],[83.0,218.5],[89.5,222.0],[94.5,222.5],[95.5,223.0],[95.0,224.0],[92.5,226.5],[93.0,228.5],[94.5,229.0],[102.0,225.5],[110.0,216.5],[116.5,203.5],[119.5,203.0],[130.0,196.5],[131.5,193.0],[136.5,195.0],[138.5,195.0],[140.0,194.0],[141.0,192.0],[145.0,191.5],[142.0,176.5],[143.0,173.5],[143.0,171.0],[142.0,170.0],[139.5,169.5],[139.0,168.5],[144.0,161.5],[149.5,157.0],[155.5,153.5],[156.5,151.0],[159.5,150.5],[163.0,149.5],[181.5,151.5],[199.0,157.5],[202.0,158.0],[208.0,158.0],[210.5,159.5],[222.5,161.5],[226.0,161.5],[241.5,158.0],[248.5,154.0],[256.0,148.0],[257.0,148.0],[258.0,149.5],[265.5,154.5],[271.5,156.5],[271.5,158.5],[273.5,161.0],[278.5,163.5],[280.5,170.0],[285.5,176.5],[284.5,179.5],[290.0,186.5],[289.5,191.0],[294.0,200.5],[294.0,203.5],[296.0,210.5],[296.0,214.0],[299.0,218.5],[303.0,222.0],[305.0,221.5],[308.0,220.0],[312.5,215.0],[315.5,210.5],[317.5,206.0],[317.0,201.5],[320.0,199.5],[325.5,194.5],[327.0,191.5],[327.0,189.5],[328.5,187.5],[328.5,185.5],[327.0,184.0],[323.5,184.5],[319.0,183.5],[314.5,181.0],[309.0,176.5],[309.0,175.5],[311.0,174.0],[311.0,166.5],[308.0,155.5],[303.5,146.0],[299.0,140.0],[294.5,135.0],[290.0,134.0],[290.0,129.5],[288.5,125.5],[285.0,119.0],[279.0,113.0],[273.0,109.5],[269.0,110.0],[268.5,109.5],[267.0,104.0],[263.0,95.0],[257.0,87.0],[253.0,83.0],[247.5,79.5],[246.0,79.5],[245.0,80.5],[243.0,79.5],[241.5,77.5],[233.5,70.0],[229.0,67.0],[222.0,64.0],[209.0,61.0],[193.5,61.0],[186.0,62.5],[176.5,66.0],[168.5,71.5],[161.0,79.5],[157.5,75.5],[153.5,75.0],[144.5,79.0],[137.0,82.5],[137.0,86.5],[143.5,101.5],[146.0,104.0],[145.5,106.0],[139.5,111.5],[131.0,116.0],[129.5,118.0],[124.5,118.5],[112.5,121.5],[104.0,125.5],[95.5,133.0],[90.0,141.5],[87.5,147.5],[87.0,150.5],[87.0,161.0],[87.5,164.5],[83.5,166.0],[81.5,171.5],[81.5,180.0],[83.0,187.0],[84.5,191.0],[83.0,192.0],[79.0,191.5],[72.5,188.0],[70.5,188.5]]],"shadows":[[[295.0,200.5],[294.0,203.0],[297.0,216.0],[302.0,221.0],[306.0,221.0],[312.5,215.0],[316.0,210.0],[316.5,206.5],[315.5,206.0],[310.5,208.0],[306.5,208.0],[301.5,205.5],[296.5,201.0]],[[71.0,198.0],[71.5,202.5],[74.5,209.5],[78.5,214.5],[84.0,219.0],[91.0,222.0],[94.5,222.5],[101.5,214.5],[101.0,211.0],[84.0,207.0],[79.5,204.0],[73.0,197.5]],[[116.5,189.0],[117.0,190.5],[123.5,193.0],[124.5,192.0],[124.0,190.5],[121.0,188.0],[118.0,188.0]],[[290.5,186.5],[292.5,190.5],[302.0,199.5],[308.5,201.0],[319.5,200.0],[325.0,195.0],[327.0,190.5],[326.5,189.0],[325.5,188.5],[317.0,192.0],[307.5,193.0],[299.0,190.0],[292.5,185.5]],[[83.0,183.0],[83.0,186.5],[84.5,189.5],[86.5,190.0],[89.0,188.5],[89.0,187.0],[86.0,183.5]],[[96.5,182.0],[97.5,185.0],[105.0,189.5],[106.0,193.0],[108.5,193.0],[110.0,192.0],[111.0,189.5],[109.0,187.0],[98.5,181.5]],[[279.0,163.0],[279.0,164.5],[280.5,166.5],[284.5,167.0],[286.5,165.5],[285.5,163.5],[280.5,161.5]],[[155.0,148.5],[146.0,148.5],[136.0,151.5],[128.5,156.5],[122.0,165.0],[120.0,171.5],[121.0,182.5],[123.5,185.5],[133.0,193.5],[137.5,195.0],[140.0,193.0],[137.0,189.0],[134.5,182.5],[134.5,177.0],[135.5,171.5],[144.0,161.5],[155.5,153.5],[156.5,149.5]],[[103.0,146.5],[100.5,149.0],[98.0,157.0],[98.0,168.0],[100.5,175.0],[105.0,181.0],[113.5,183.5],[114.5,181.5],[111.0,175.5],[108.0,165.5],[108.0,157.0],[109.5,147.5],[107.5,146.5]],[[286.5,140.5],[285.0,140.0],[277.5,146.0],[263.5,151.5],[264.0,153.0],[269.0,155.5],[271.0,155.0],[283.0,147.5],[286.0,143.5]],[[273.0,124.5],[272.0,123.0],[265.5,123.5],[261.0,131.5],[254.0,139.0],[244.0,145.5],[232.5,149.0],[232.5,148.0],[239.5,140.0],[244.5,131.5],[248.0,122.5],[248.0,120.5],[246.0,119.5],[234.0,133.5],[222.0,142.0],[214.0,145.5],[204.5,148.0],[187.0,150.5],[186.0,152.5],[199.0,157.5],[208.0,158.0],[210.5,159.5],[223.0,161.5],[240.0,158.0],[254.0,149.5],[256.0,147.5],[256.5,145.0],[259.0,142.5],[261.0,144.0],[258.0,147.5],[258.5,149.5],[260.0,150.0],[263.0,148.0],[270.5,136.0],[273.0,128.0]],[[130.0,117.5],[130.5,119.5],[132.5,122.0],[135.0,121.5],[138.5,118.5],[137.5,117.0],[132.0,116.0]],[[200.0,84.5],[195.5,80.5],[188.0,79.0],[186.0,77.0],[178.0,79.5],[175.5,84.0],[167.0,88.5],[157.0,105.5],[151.5,111.0],[145.0,115.0],[144.5,117.0],[146.0,117.5],[156.5,117.0],[163.0,115.5],[167.5,112.5],[169.0,113.0],[171.5,115.5],[179.5,116.5],[190.0,113.0],[193.0,108.0],[198.5,102.0],[201.0,94.5],[199.5,92.5],[196.0,91.5],[190.5,92.5],[185.0,95.5],[184.0,94.5],[192.0,89.0],[200.0,88.0]]],"strands":[[[108.0,196.5],[107.0,196.5],[105.5,197.5],[103.5,202.0],[103.5,203.5],[105.0,203.5],[106.0,202.0],[108.5,197.5]],[[299.0,168.0],[304.5,174.0],[303.5,172.5],[304.0,172.0],[307.5,173.5],[303.0,169.5],[300.0,168.0]],[[286.5,166.5],[293.5,169.0],[294.0,168.5],[294.0,168.0],[293.0,166.5],[287.5,165.0],[287.5,165.5]],[[114.0,138.0],[113.0,138.0],[111.0,139.0],[106.5,142.5],[103.5,145.0],[103.5,146.0],[105.5,145.5],[108.5,142.0],[112.5,139.5]],[[250.0,107.5],[249.5,107.5],[246.0,118.0],[246.0,119.0],[247.0,118.5],[248.0,120.0],[249.0,118.0],[250.0,109.0]],[[246.5,84.5],[247.0,86.5],[245.5,87.5],[248.0,93.5],[250.0,101.0],[250.0,96.0],[249.5,90.5],[248.0,87.0]]],"inks":[[[105.0,210.0],[102.5,211.5],[103.0,212.5],[102.0,214.5],[96.5,221.0],[97.5,223.5],[100.5,221.0],[104.0,216.0],[105.0,211.0]],[[315.0,203.5],[315.0,200.5],[311.5,201.5],[307.5,201.5],[305.5,201.0],[306.0,201.5],[310.0,203.5]],[[93.5,188.5],[91.5,189.0],[87.0,190.0],[86.5,192.5],[87.0,192.5],[91.0,190.5]],[[136.5,170.0],[135.0,176.0],[135.0,181.5],[136.5,187.0],[137.5,189.5],[139.0,191.0],[141.0,190.0],[138.5,186.5],[137.5,182.5],[137.5,176.5],[139.0,171.5]],[[261.0,143.5],[259.5,142.5],[256.5,145.5],[259.0,146.5]],[[291.5,137.0],[288.5,136.0],[287.5,142.5],[284.0,147.0],[280.0,150.0],[274.0,153.0],[272.0,154.5],[273.0,155.0],[274.0,154.0],[277.0,153.0],[285.0,148.5],[288.5,143.5]],[[176.5,116.5],[174.0,116.5],[173.0,116.0],[169.5,116.0],[168.5,117.0],[167.5,117.0],[167.5,117.5],[174.0,117.5]],[[169.5,113.0],[168.5,113.5],[168.0,113.0],[166.0,113.5],[164.5,116.0],[158.5,116.5],[158.0,117.5],[148.0,117.5],[141.5,119.0],[138.5,120.5],[128.5,125.0],[124.5,127.5],[120.5,131.5],[115.5,137.0],[110.5,147.0],[108.5,155.5],[108.5,164.0],[109.0,168.5],[111.5,175.0],[114.0,180.0],[117.5,184.5],[117.0,185.0],[114.5,185.0],[106.5,182.5],[101.0,179.5],[98.0,177.0],[93.5,172.0],[89.5,165.5],[87.5,167.0],[91.5,174.0],[99.5,182.0],[106.0,185.5],[110.5,186.5],[111.0,187.0],[110.5,188.0],[111.0,188.5],[112.0,187.0],[121.0,187.0],[129.0,192.5],[130.5,191.0],[125.0,187.5],[120.5,184.0],[117.5,181.0],[114.0,174.0],[112.0,168.0],[111.0,162.5],[111.0,156.0],[112.5,150.0],[116.0,142.0],[119.0,137.0],[123.5,132.5],[129.5,127.5],[133.5,125.0],[139.5,122.5],[149.0,119.5],[157.0,118.0],[165.0,117.5],[165.5,117.0],[167.0,117.0],[166.0,115.5],[168.0,114.5]],[[267.5,111.5],[268.5,123.5],[269.0,123.5],[270.0,122.5],[271.0,115.0],[270.0,112.0]],[[243.0,82.0],[245.5,86.5],[246.0,86.5],[245.5,82.5]],[[176.5,82.5],[175.5,81.5],[175.0,81.5],[171.5,84.0],[170.0,86.5],[170.5,86.0],[171.0,86.5]],[[161.5,81.5],[158.5,81.0],[157.5,83.0],[152.0,94.5],[147.0,102.0],[148.5,104.0],[153.5,97.0],[158.5,86.5],[161.5,82.0]],[[189.0,76.5],[188.0,77.0],[187.5,78.5],[192.5,79.0],[195.5,80.0],[198.0,81.5],[200.5,84.5],[202.0,89.0],[201.5,90.5],[198.5,89.0],[193.5,89.0],[187.5,91.5],[183.5,95.0],[185.0,95.0],[189.5,92.5],[194.5,91.0],[198.0,91.5],[201.5,93.0],[202.0,95.5],[199.0,101.5],[197.0,104.5],[193.0,108.5],[193.5,110.0],[192.0,111.0],[192.0,111.0],[196.0,108.5],[199.5,105.0],[201.5,102.0],[203.5,96.5],[204.5,89.5],[203.0,84.5],[199.5,80.0],[194.5,77.5]]]},"sweep":{"outer":[[[71.5,183.5],[73.0,187.5],[75.5,189.0],[75.5,193.0],[77.0,196.0],[82.5,200.5],[81.0,202.5],[81.0,204.5],[83.0,210.0],[86.0,213.5],[90.0,213.5],[93.5,207.5],[92.5,205.5],[94.5,200.5],[98.5,196.5],[99.0,195.0],[98.0,194.0],[98.0,193.0],[109.5,169.5],[122.0,150.0],[128.5,141.5],[132.0,139.5],[136.5,134.0],[136.0,132.0],[138.0,130.0],[140.0,130.0],[142.5,128.0],[147.0,124.0],[148.5,124.5],[150.5,128.5],[152.5,128.5],[173.5,152.0],[191.5,166.5],[214.0,179.5],[232.0,187.0],[240.5,189.0],[244.5,191.5],[247.0,191.0],[256.5,195.5],[271.0,200.0],[276.0,202.5],[283.0,202.5],[285.0,203.0],[301.0,202.5],[312.5,200.5],[320.5,197.5],[326.5,195.0],[334.5,189.0],[338.0,186.0],[341.5,180.5],[342.0,177.0],[341.0,176.0],[339.0,175.5],[334.0,177.0],[325.5,177.0],[313.5,173.5],[306.5,169.5],[307.5,165.5],[298.5,149.0],[287.5,132.5],[282.0,126.0],[271.0,114.5],[264.0,109.0],[256.0,104.0],[243.0,97.5],[229.5,93.0],[214.0,90.5],[196.5,90.5],[181.0,93.5],[171.5,96.5],[163.0,100.5],[154.5,106.0],[151.0,109.0],[148.0,114.5],[143.0,115.0],[136.5,118.0],[130.0,122.5],[124.0,128.0],[111.5,136.5],[99.5,149.5],[95.0,156.5],[90.5,169.5],[90.5,175.0],[91.5,177.0],[88.0,180.0],[82.5,181.5],[78.5,181.5],[73.0,180.5],[71.5,181.5]]],"shadows":[[[82.0,204.5],[81.5,207.0],[84.5,212.5],[87.0,213.5],[90.0,213.0],[92.5,209.5],[92.5,207.5],[83.5,204.0]],[[75.5,190.0],[75.5,193.0],[77.0,195.5],[82.0,199.5],[94.5,199.5],[98.0,196.0],[96.5,194.5],[84.5,192.5],[78.0,189.0]],[[231.5,176.5],[233.0,179.0],[245.0,187.5],[248.0,191.5],[252.0,193.5],[276.0,202.0],[285.5,203.0],[305.5,201.5],[321.5,197.5],[335.0,188.5],[341.5,180.0],[341.0,178.5],[339.5,178.5],[331.5,183.5],[318.0,188.0],[308.0,188.5],[293.5,187.5],[293.0,189.0],[294.5,191.0],[307.0,197.5],[306.0,198.5],[289.0,197.5],[271.5,193.0],[255.5,187.0],[233.5,175.5]],[[285.5,155.0],[288.5,160.5],[296.5,166.5],[299.0,166.5],[301.0,164.5],[300.5,162.5],[288.0,155.0]],[[149.0,122.0],[146.5,120.5],[142.5,121.0],[129.5,127.0],[129.0,128.5],[140.0,129.5],[146.5,124.0],[148.5,124.0]]],"strands":[[[285.5,183.5],[286.0,185.0],[289.5,187.5],[292.0,188.5],[292.5,187.5],[292.5,186.5]],[[158.5,119.5],[159.5,121.5],[159.0,122.0],[165.5,124.0],[173.5,129.0],[187.5,138.5],[192.0,143.5],[193.0,143.0],[182.5,133.0],[174.5,127.0],[166.5,122.0],[161.0,120.0]],[[207.5,110.0],[208.0,110.5],[211.0,110.5],[219.0,112.5],[219.0,113.0],[215.0,112.5],[226.0,116.0],[238.0,121.5],[248.5,128.0],[258.5,136.0],[258.5,135.5],[256.0,133.5],[256.5,133.0],[257.5,133.0],[260.5,135.0],[244.5,123.5],[231.0,116.0],[223.5,112.5],[216.0,110.0],[214.5,111.0],[210.5,110.0],[210.0,109.5]],[[165.0,102.0],[162.5,104.0],[157.5,109.5],[155.0,113.0],[159.0,109.5],[165.5,102.5]]],"inks":[[[92.5,199.5],[91.5,199.0],[92.0,200.0],[90.5,201.0],[84.5,199.5],[84.5,201.0],[84.0,202.5],[87.0,202.5],[90.0,202.0],[92.0,201.0]],[[102.5,167.0],[93.0,174.0],[93.0,175.0],[93.5,177.0],[98.5,172.5]],[[300.5,165.5],[300.0,168.0],[304.5,170.5],[305.0,167.0]],[[193.0,144.0],[209.5,161.0],[223.0,173.5],[223.0,173.0],[236.5,183.5],[244.5,189.0],[246.0,189.0],[228.5,176.0],[214.5,163.5],[214.0,164.5],[210.5,160.0],[211.0,159.5],[206.0,155.5],[205.0,156.0],[205.0,155.0],[205.5,154.5],[204.0,153.0],[202.5,153.0],[201.0,150.5]],[[260.0,136.0],[286.0,158.5],[287.0,159.0],[281.0,153.5],[281.0,152.5],[281.5,153.0],[281.5,152.5],[279.5,152.5],[279.0,151.0],[278.5,151.0],[276.5,149.5],[277.5,148.5],[269.5,142.5],[269.0,142.5],[269.5,143.5],[267.0,142.0],[265.0,140.0],[266.0,140.0],[265.5,139.0],[264.0,139.0],[264.5,138.5],[261.0,136.0]],[[149.0,116.5],[147.0,117.0],[147.0,119.5],[148.5,121.0],[149.0,120.5]],[[207.0,108.5],[198.5,107.0],[189.0,106.5],[179.0,107.0],[175.5,107.5],[175.0,108.0],[172.0,108.5],[171.5,109.0],[168.5,109.0],[162.0,111.5],[162.0,112.5],[156.0,116.0],[153.5,115.5],[152.0,117.5],[152.5,118.5],[152.5,119.5],[151.0,120.5],[154.0,120.5],[158.5,121.0],[158.5,120.5],[155.0,118.5],[156.5,118.0],[155.5,117.0],[158.0,115.5],[161.0,115.0],[164.5,113.5],[166.0,113.5],[170.0,111.5],[175.0,110.5],[185.5,109.0],[195.5,109.0],[207.0,110.5],[207.0,110.0],[205.5,109.5]]]},"shag":{"outer":[[[340.0,192.5],[339.0,191.5],[332.0,190.0],[325.5,186.5],[317.0,179.0],[313.0,173.5],[314.0,172.5],[320.0,171.5],[327.0,168.5],[333.5,163.0],[334.0,161.5],[333.0,160.5],[329.5,160.0],[323.5,158.0],[314.0,152.0],[307.0,145.0],[292.0,125.5],[278.5,113.0],[271.0,107.5],[260.5,103.5],[252.0,102.0],[247.5,102.5],[244.5,94.0],[242.5,89.5],[235.0,79.5],[223.5,71.0],[209.5,65.5],[207.0,66.0],[206.0,67.5],[210.5,73.0],[213.0,75.0],[213.0,76.5],[212.5,77.0],[207.0,74.5],[198.0,71.5],[193.5,71.0],[180.0,71.0],[168.5,73.5],[151.0,79.0],[140.5,81.0],[134.0,81.0],[132.0,80.5],[128.5,81.0],[128.0,81.5],[128.0,83.0],[132.5,87.5],[133.5,90.5],[137.5,94.5],[145.0,99.5],[146.0,101.0],[135.5,105.5],[126.0,112.0],[114.5,124.5],[109.0,125.0],[108.5,126.5],[110.0,130.0],[95.0,145.0],[88.0,150.5],[81.5,153.5],[74.0,155.5],[66.5,156.0],[59.0,155.0],[57.5,156.0],[61.0,164.5],[67.0,173.0],[74.0,178.0],[80.5,181.0],[81.0,182.5],[80.0,186.0],[78.0,188.5],[78.0,191.0],[75.0,195.0],[69.5,200.5],[65.0,203.5],[57.5,206.5],[57.0,209.0],[61.0,212.0],[70.5,216.0],[76.5,217.5],[88.5,217.5],[89.0,218.5],[86.5,224.5],[86.5,226.5],[88.0,227.5],[90.0,227.0],[95.0,224.5],[101.0,218.5],[104.5,213.0],[112.0,218.5],[118.0,221.5],[121.0,221.5],[121.5,219.0],[119.5,215.0],[118.0,209.5],[119.0,207.5],[119.0,199.5],[120.5,195.5],[120.0,192.5],[133.0,186.5],[143.0,179.0],[157.0,165.0],[168.0,150.5],[169.5,146.5],[175.5,145.0],[187.5,140.5],[188.5,140.5],[189.0,141.5],[186.5,148.5],[183.5,165.0],[183.5,186.0],[184.5,192.5],[188.0,203.0],[192.0,210.5],[196.5,216.0],[198.0,216.0],[199.5,213.5],[200.0,209.0],[203.0,202.5],[206.5,201.5],[215.0,194.5],[222.0,188.0],[229.5,177.5],[237.0,162.5],[241.0,149.0],[242.0,143.0],[242.5,142.0],[246.5,143.5],[252.0,147.5],[260.5,155.5],[268.5,166.0],[276.5,182.5],[278.0,184.5],[278.0,187.5],[279.0,190.0],[279.0,194.0],[280.5,198.0],[280.5,209.0],[279.0,216.0],[278.0,219.0],[278.5,221.5],[280.0,221.5],[284.5,219.5],[294.5,211.0],[300.0,219.0],[303.0,222.5],[308.0,225.5],[314.5,225.5],[324.0,223.5],[327.5,221.5],[328.5,220.5],[328.0,219.0],[320.5,215.0],[316.0,210.0],[314.5,207.5],[315.5,206.5],[319.0,206.5],[323.5,205.5],[333.5,200.0],[339.5,194.0]]],"shadows":[[[103.0,215.0],[103.0,213.5],[100.5,212.0],[98.5,201.5],[96.5,200.0],[89.0,205.0],[82.0,208.0],[73.0,210.0],[62.0,209.0],[60.5,210.5],[61.5,212.0],[71.0,216.0],[77.0,217.5],[88.5,217.5],[89.0,218.5],[87.5,224.5],[90.0,226.5],[95.5,224.0]],[[118.5,208.0],[119.5,198.5],[118.5,195.5],[100.5,198.0],[100.5,200.0],[102.0,202.5],[113.0,204.0],[116.5,209.5]],[[302.5,193.5],[299.5,204.0],[295.5,211.0],[296.0,213.0],[300.5,219.5],[305.0,223.5],[309.0,225.5],[319.0,225.0],[327.0,221.5],[327.5,219.0],[320.5,215.0],[314.5,207.5],[323.5,205.5],[331.0,202.0],[337.0,197.0],[337.5,194.5],[335.5,194.0],[328.0,196.5],[319.0,197.0]],[[212.5,187.5],[211.0,188.0],[207.0,195.5],[206.0,199.0],[207.0,200.0],[211.5,197.5],[213.5,189.0]],[[308.5,164.0],[309.5,167.5],[315.0,172.5],[324.5,170.0],[331.0,164.5],[330.5,163.0],[322.0,165.0],[310.5,163.0]],[[60.5,162.0],[61.5,165.0],[68.0,173.5],[73.5,177.5],[81.0,181.5],[79.5,187.5],[81.5,190.5],[84.0,190.0],[93.5,184.0],[103.0,172.5],[102.0,170.5],[91.5,172.5],[79.0,171.0],[70.0,167.0],[62.5,161.0]],[[245.0,140.0],[244.5,142.0],[256.0,151.5],[258.5,151.0],[257.5,148.5],[251.0,142.0],[247.0,139.5]],[[113.5,138.5],[114.5,141.0],[117.0,143.5],[129.5,150.5],[141.5,154.5],[156.5,156.0],[157.5,157.5],[154.0,164.0],[154.5,166.0],[157.0,165.0],[167.5,150.5],[166.0,149.0],[148.0,149.5],[136.0,147.0],[125.5,143.5],[115.5,137.5]],[[194.0,128.0],[192.5,127.0],[178.5,135.5],[170.0,139.0],[156.5,142.5],[156.0,144.5],[158.0,145.5],[167.0,145.0],[170.5,146.0],[184.0,142.0],[188.0,140.0]],[[227.0,103.0],[227.0,104.5],[230.5,109.0],[232.5,110.0],[234.5,109.5],[234.5,106.5],[233.0,104.0],[228.5,102.0]],[[141.0,104.0],[141.5,106.0],[147.5,109.0],[149.5,108.5],[153.0,106.0],[152.0,104.0],[146.5,101.5],[142.5,102.5]],[[133.0,88.0],[133.5,90.5],[138.0,94.5],[145.0,99.5],[148.5,99.0],[153.0,100.0],[154.5,103.5],[157.5,105.5],[161.0,104.0],[161.5,100.5],[166.0,96.5],[164.0,95.0],[147.0,92.5],[135.5,87.0]]],"strands":[[[221.5,160.0],[219.5,165.0],[220.0,165.5],[221.5,161.0]],[[295.0,149.0],[295.5,150.0],[299.5,157.0],[300.0,156.0],[301.0,156.0],[296.5,150.0]],[[265.0,119.5],[265.5,120.5],[264.5,121.5],[270.0,124.5],[278.5,130.5],[273.5,125.0],[269.0,121.5]],[[246.0,114.5],[245.0,114.5],[242.5,115.5],[241.0,117.0],[246.0,116.5],[245.5,116.0]],[[144.0,114.0],[143.0,114.0],[137.5,118.0],[132.0,121.0],[124.0,123.5],[118.0,124.0],[116.5,126.0],[121.5,126.0],[132.5,123.0],[144.0,117.0],[143.5,115.5]],[[230.0,109.0],[224.0,108.0],[224.5,107.5],[228.5,108.0],[226.5,107.0],[220.0,108.0],[213.5,111.0],[206.0,116.5],[207.0,116.5],[207.0,117.5],[211.5,114.0],[220.0,110.5]],[[227.5,92.5],[227.0,93.0],[231.0,101.0],[233.0,103.5],[233.0,101.0],[230.0,95.0]],[[182.0,93.0],[183.0,93.5],[182.5,94.5],[191.5,93.0],[199.0,93.0],[204.0,94.0],[204.0,93.0],[204.5,93.0],[205.5,93.5],[205.0,94.0],[206.0,94.0],[210.5,93.5],[210.0,92.5],[199.0,91.0],[190.5,91.5],[185.5,92.5]],[[218.5,79.5],[218.0,80.5],[219.0,81.5],[218.5,83.0],[223.0,86.5],[221.0,82.5]]],"inks":[[[99.0,198.5],[99.0,203.5],[102.0,210.5],[102.0,211.0],[101.0,211.5],[100.5,212.0],[102.0,212.5],[104.0,211.5],[105.0,211.5],[105.5,211.0],[103.0,207.5],[100.0,200.0]],[[300.5,184.5],[298.0,199.0],[296.0,204.0],[293.5,209.0],[296.5,209.0],[300.0,201.0],[301.5,194.5],[301.0,187.5]],[[219.5,166.0],[216.0,174.0],[210.5,182.5],[211.0,184.0],[204.5,194.5],[202.0,200.5],[205.0,199.5],[210.0,188.0],[214.0,181.0],[216.0,175.0],[217.0,174.0]],[[114.0,160.0],[106.0,169.0],[106.0,170.0],[98.0,180.0],[93.5,184.5],[84.0,191.0],[84.0,192.0],[85.5,194.0],[88.0,195.0],[97.0,196.0],[99.0,197.0],[107.0,196.5],[118.0,194.5],[118.0,191.5],[110.5,193.5],[106.5,194.0],[98.0,194.0],[90.0,192.5],[87.5,191.5],[88.0,190.5],[95.0,186.5],[102.0,179.0],[105.0,174.5]],[[300.5,156.5],[300.5,157.5],[303.0,162.0],[311.0,173.0],[312.5,170.5],[310.0,168.5],[305.5,163.0],[305.5,162.0]],[[267.0,149.5],[269.5,156.5],[271.0,158.5],[273.5,168.5],[273.5,170.0],[274.0,170.5],[274.0,171.5],[276.0,172.0],[276.0,173.5],[277.0,174.0],[277.0,175.5],[277.5,176.5],[277.0,178.0],[277.5,179.5],[278.5,181.5],[279.5,182.5],[278.0,176.0],[277.5,175.0],[276.5,171.5],[273.5,161.5],[270.0,154.0]],[[111.0,132.0],[114.0,135.5],[120.0,140.0],[127.5,144.0],[133.5,146.0],[148.0,149.0],[159.0,149.0],[167.0,148.0],[167.0,145.0],[159.0,146.0],[153.0,146.0],[143.5,145.0],[136.0,143.0],[128.0,140.5],[123.0,138.0],[117.5,134.5],[112.5,130.0]],[[240.5,119.5],[242.0,128.5],[241.0,140.5],[241.5,140.5],[244.0,140.5],[243.0,126.5],[242.0,123.0]],[[206.0,117.0],[203.0,118.5],[197.5,123.5],[197.5,125.0],[189.0,138.5],[191.0,140.0],[191.5,140.0],[194.0,134.5],[199.0,126.0]],[[246.5,115.0],[247.5,115.0],[246.5,116.0],[253.0,116.5],[259.5,118.5],[263.5,120.5],[265.0,120.5],[264.0,120.0],[264.0,119.5],[259.0,116.5],[259.0,117.0],[259.5,118.0],[252.0,116.0],[252.0,115.5],[253.0,114.5],[250.0,114.5]],[[157.5,106.0],[156.0,105.0],[155.0,105.5],[147.5,111.0],[145.0,113.5],[145.0,114.5],[144.0,115.5],[148.5,113.0]],[[148.0,99.5],[148.0,102.0],[154.5,103.5],[153.5,102.5],[153.5,100.5]],[[182.0,94.0],[179.0,93.5],[170.5,96.0],[161.5,100.5],[161.0,101.5],[161.5,103.5],[176.0,95.5],[180.0,95.0],[180.5,94.0]],[[210.0,94.5],[216.0,97.0],[224.0,102.0],[226.5,101.0],[227.5,101.0],[228.5,102.0],[227.5,100.0],[223.0,97.5],[221.0,99.0],[218.0,96.5],[218.0,95.0],[216.5,94.5],[211.0,93.0],[213.0,94.0],[213.5,95.0]],[[213.0,79.0],[218.5,82.0],[215.5,77.0]]]},"swept":{"outer":[[[334.5,121.0],[330.5,118.5],[325.0,120.0],[316.0,120.0],[305.0,117.5],[303.5,116.5],[304.0,115.0],[311.0,112.0],[311.0,111.0],[310.0,109.0],[305.5,108.5],[304.5,106.5],[301.5,106.5],[291.5,103.5],[277.5,96.5],[269.5,94.0],[259.5,91.5],[240.0,92.0],[239.5,91.0],[243.5,87.0],[251.0,82.0],[259.0,78.0],[270.0,76.0],[276.0,73.5],[276.5,72.5],[276.0,71.0],[276.5,69.5],[258.0,62.5],[250.0,60.5],[240.5,59.0],[229.5,59.0],[227.5,60.0],[224.0,60.0],[217.0,61.5],[204.5,66.0],[204.0,65.0],[205.5,62.5],[212.0,53.0],[212.5,51.0],[217.0,47.0],[216.0,43.5],[215.5,43.0],[207.5,44.0],[196.5,47.5],[184.5,53.0],[172.5,61.5],[165.0,69.0],[160.5,75.0],[159.5,75.0],[157.5,73.0],[154.0,72.5],[138.0,80.0],[136.5,82.0],[136.5,84.0],[139.0,89.5],[139.0,91.0],[129.5,99.5],[126.0,104.0],[122.5,112.0],[120.5,113.0],[118.0,111.5],[115.5,112.5],[109.5,118.0],[105.0,124.0],[101.0,135.0],[101.0,142.0],[97.5,142.5],[94.5,145.0],[91.5,149.5],[89.0,156.0],[88.5,158.5],[88.5,173.5],[82.5,175.5],[75.5,174.5],[73.5,176.0],[72.0,179.0],[75.5,187.0],[82.5,194.5],[81.0,196.5],[81.0,198.5],[85.0,208.5],[86.5,211.0],[88.0,211.5],[92.0,209.5],[104.0,194.0],[106.5,191.5],[108.5,191.0],[109.5,190.0],[109.5,189.0],[107.5,186.5],[112.0,179.5],[114.5,178.5],[116.5,179.5],[137.5,168.0],[147.5,166.5],[159.0,166.0],[160.5,165.5],[166.5,165.5],[168.0,166.0],[173.0,166.0],[174.5,166.5],[184.0,167.5],[203.0,161.5],[220.0,159.0],[221.5,158.5],[225.5,158.5],[227.0,158.0],[230.5,158.0],[232.0,158.5],[236.0,158.5],[237.5,159.0],[254.5,161.5],[269.0,167.0],[275.5,169.0],[279.5,171.5],[285.0,177.5],[287.5,177.5],[291.0,179.5],[304.5,193.0],[305.5,195.5],[309.0,196.5],[311.0,197.5],[311.5,200.0],[312.5,201.0],[316.5,201.5],[317.0,200.5],[317.0,198.0],[316.0,195.5],[324.0,190.5],[328.5,186.5],[331.5,181.5],[329.5,178.5],[330.0,177.5],[329.5,176.5],[324.5,176.5],[323.5,174.5],[317.5,173.0],[314.5,171.0],[315.0,170.0],[317.5,169.0],[321.0,164.5],[323.5,156.5],[320.5,153.5],[317.5,154.0],[314.0,153.5],[309.5,151.5],[309.0,150.0],[321.5,144.0],[327.5,137.5],[330.5,133.0],[332.0,129.0],[329.5,126.5],[330.0,125.0],[331.0,124.0],[333.5,124.0]]],"shadows":[[[82.5,198.5],[82.0,202.5],[86.5,210.5],[88.5,211.0],[91.0,210.0],[94.5,206.0],[94.5,204.0]],[[73.5,181.0],[75.5,186.5],[81.5,193.5],[92.5,195.5],[95.0,194.5],[95.5,192.5],[94.0,190.0],[83.5,186.5],[75.5,180.5]],[[330.5,181.0],[328.0,179.5],[321.0,183.5],[314.0,185.0],[306.0,184.5],[298.5,182.5],[297.0,183.0],[296.5,184.0],[306.0,195.5],[313.5,198.0],[315.5,197.0],[316.5,195.0],[324.5,190.0],[329.5,184.5]],[[169.0,150.5],[167.5,152.0],[168.0,153.5],[171.0,155.5],[173.0,155.0],[173.5,151.5],[171.5,150.0]],[[156.0,140.5],[155.0,142.0],[157.0,146.5],[162.5,150.5],[164.5,151.0],[165.0,148.5],[157.5,140.5]],[[222.0,135.0],[223.0,137.0],[238.5,136.0],[251.5,139.0],[257.5,142.0],[259.5,145.5],[265.0,146.5],[277.0,153.0],[280.5,157.5],[290.0,158.0],[294.5,162.0],[301.0,161.0],[307.5,164.0],[315.5,170.0],[319.0,167.5],[319.5,165.0],[315.0,163.5],[314.5,162.0],[317.5,160.0],[322.0,161.0],[323.5,158.5],[323.0,156.0],[320.5,154.0],[314.0,153.5],[309.5,151.5],[302.5,152.0],[293.0,150.5],[281.5,146.0],[263.0,137.0],[256.0,134.5],[237.0,132.0],[227.0,133.0]],[[331.5,130.0],[330.0,127.5],[328.5,127.5],[322.5,132.5],[316.5,136.0],[303.5,139.5],[291.5,140.0],[277.0,137.5],[276.5,138.5],[278.5,141.0],[289.0,146.0],[299.5,148.0],[307.0,148.0],[310.0,149.0],[322.0,143.5],[327.5,137.5],[331.0,132.5]],[[117.0,117.0],[115.5,121.5],[115.5,128.0],[116.5,134.0],[120.0,140.5],[126.5,149.5],[129.0,149.0],[129.5,148.0],[128.0,145.5],[129.0,145.0],[134.0,147.5],[135.5,151.5],[138.5,152.0],[140.5,149.5],[140.5,147.5],[133.0,143.0],[124.0,134.0],[120.5,132.5],[119.0,125.5],[119.0,117.5]],[[206.0,107.0],[204.0,107.5],[198.5,115.5],[199.5,117.0],[201.5,116.5],[206.5,111.0],[207.0,108.5]],[[146.5,107.0],[145.0,109.0],[145.0,120.5],[150.0,133.0],[152.5,136.0],[154.0,135.0],[149.5,120.0],[148.0,108.0]],[[261.5,76.0],[260.0,75.0],[248.5,77.5],[229.0,85.0],[214.0,94.5],[208.5,101.5],[208.5,103.5],[210.5,104.0],[228.5,93.5],[240.0,90.5],[246.5,85.0],[256.5,79.0],[261.0,77.5]],[[204.5,62.0],[201.5,60.0],[199.0,60.0],[191.0,69.5],[190.5,72.0],[193.0,72.0],[204.0,65.0]],[[211.0,51.0],[209.0,51.5],[205.5,54.5],[205.0,56.5],[206.0,58.0],[208.0,58.0],[211.5,52.5]]],"strands":[[[107.5,183.0],[102.5,187.5],[103.5,187.5],[105.0,186.5]],[[98.0,168.0],[97.5,167.5],[96.0,168.0],[91.0,171.5],[93.0,170.5],[92.5,171.5],[94.0,171.5],[93.0,173.0],[96.5,170.0]],[[115.5,163.5],[114.0,163.0],[111.0,163.5],[108.5,165.0],[107.5,165.5],[108.0,166.0],[114.5,165.0],[115.0,165.0],[114.5,164.0]],[[127.5,150.5],[128.5,152.0],[131.0,155.0],[135.0,158.0],[135.5,157.5],[129.5,150.5]],[[242.5,143.0],[243.5,145.0],[257.5,145.0],[256.0,144.5],[258.0,144.0],[255.5,142.5],[251.5,142.5]],[[286.5,111.0],[286.5,111.5],[291.0,114.0],[293.0,114.0],[292.5,113.5],[293.5,113.5],[292.5,112.0]],[[175.5,102.5],[174.0,102.5],[173.5,108.0],[174.0,107.0]],[[149.5,84.0],[141.0,88.0],[142.0,90.0],[148.5,86.5],[150.0,85.5],[148.5,85.5]]],"inks":[[[84.0,197.0],[88.5,197.0],[91.5,196.0],[89.5,196.0],[88.5,195.0],[84.5,194.0]],[[105.5,187.5],[103.0,188.0],[102.5,189.0],[101.5,188.0],[98.0,190.5],[95.5,190.5],[95.5,191.0],[97.0,192.0],[96.0,193.5],[98.5,193.0],[104.5,189.0]],[[121.5,166.5],[119.5,168.0],[114.0,174.5],[115.5,173.5],[118.0,170.0],[119.0,170.5],[121.5,167.5]],[[297.0,162.0],[306.0,166.5],[308.5,169.0],[312.5,172.0],[313.5,168.5],[308.5,166.0],[307.5,165.0],[307.5,164.0],[305.0,164.0],[300.5,161.5],[299.5,161.5],[299.0,162.5]],[[319.5,161.5],[318.5,160.0],[318.5,161.5],[316.5,161.0],[314.5,162.5],[314.0,163.0],[317.0,164.0],[318.0,163.0],[319.0,163.5]],[[282.0,158.0],[285.5,158.5],[292.5,160.5],[291.5,159.0],[289.5,158.5],[285.0,157.5]],[[174.5,152.5],[174.0,155.0],[181.0,158.0],[185.5,159.5]],[[138.5,152.0],[145.0,153.5],[162.5,155.0],[153.0,152.5],[147.5,152.0],[141.0,150.5]],[[206.5,154.0],[208.0,154.0],[220.0,151.0],[226.0,150.5],[237.0,150.5],[244.5,151.5],[249.5,152.5],[261.5,156.5],[262.0,158.0],[264.0,158.5],[265.0,160.0],[276.5,166.5],[279.0,167.0],[278.0,166.0],[274.5,163.0],[268.0,159.0],[268.5,158.0],[279.5,158.0],[279.0,157.5],[276.5,157.0],[276.5,155.5],[267.0,157.0],[253.0,151.5],[240.5,148.5],[236.5,148.0],[232.0,148.5],[225.0,146.5],[216.0,149.5]],[[127.0,144.0],[128.0,145.5],[132.5,149.5],[132.5,150.5],[133.5,150.0],[134.5,151.0],[134.0,147.5],[132.0,147.0]],[[100.0,145.0],[101.0,147.5],[103.5,151.0],[103.5,152.5],[107.0,156.5],[110.5,159.0],[119.5,163.0],[116.5,163.5],[115.5,164.5],[123.5,163.0],[127.5,161.5],[136.5,159.0],[136.5,158.5],[126.0,159.0],[124.0,160.5],[122.5,160.5],[119.0,160.5],[115.5,159.0],[109.0,155.5],[105.0,151.5],[103.5,148.5],[102.5,143.5]],[[242.5,144.5],[242.0,144.0],[242.5,143.5],[241.5,143.0],[234.0,144.0],[234.0,144.5],[236.0,145.0],[236.5,146.0],[240.0,145.5]],[[145.5,122.0],[146.0,126.5],[149.0,134.5],[152.0,140.5],[155.5,144.0],[154.0,142.0],[154.5,140.5],[154.0,139.0],[152.5,136.5],[151.0,136.0],[149.5,133.5]],[[302.0,117.5],[301.5,114.5],[298.5,115.5],[299.0,116.5]],[[123.5,113.5],[120.5,115.0],[119.0,121.0],[120.0,129.5],[121.5,133.5],[123.0,133.0],[122.0,128.0],[122.0,123.0]],[[185.5,141.5],[185.0,151.5],[186.0,157.0],[187.0,159.0],[186.5,160.5],[187.5,160.5],[188.5,159.5],[193.5,154.0],[198.0,149.5],[197.5,149.5],[200.5,146.0],[212.0,137.0],[216.0,135.5],[218.0,136.5],[220.0,136.5],[221.0,136.0],[219.5,134.5],[221.0,134.0],[233.0,131.5],[243.5,132.0],[248.0,133.0],[254.5,134.0],[262.0,136.0],[281.5,145.5],[295.0,150.5],[302.0,151.5],[307.0,151.5],[307.5,148.5],[299.5,148.5],[289.5,146.5],[280.5,142.5],[274.5,139.0],[260.5,133.5],[259.5,132.5],[253.0,130.5],[242.5,129.5],[231.5,129.5],[217.5,132.5],[206.0,138.5],[195.5,147.5],[192.5,151.5],[188.0,158.0],[187.0,158.5],[186.5,157.0],[186.0,153.0],[187.0,146.5],[188.0,140.5],[190.0,134.0],[193.0,128.5],[192.5,128.0],[191.5,129.0],[192.0,126.0],[199.5,112.5],[207.5,102.0],[212.0,97.5],[208.5,100.0],[202.0,107.0],[193.5,118.5],[191.0,124.0],[189.5,128.5],[189.0,129.0],[189.0,130.5],[188.0,131.0],[188.5,133.0],[187.5,133.0],[187.0,134.0]],[[237.5,91.5],[235.5,91.5],[228.0,94.0],[224.0,97.0],[217.5,99.5],[210.0,105.0],[208.0,107.0],[207.5,109.5],[217.5,102.0],[226.5,97.5],[238.5,94.0]],[[158.0,77.0],[154.5,83.0],[151.0,92.0],[149.0,101.5],[149.5,116.0],[152.5,129.5],[156.0,137.0],[161.5,144.5],[168.5,151.0],[170.5,149.5],[168.0,148.0],[163.5,143.0],[156.5,132.5],[153.0,124.5],[151.5,118.0],[151.0,106.0],[153.0,95.0],[156.5,85.0],[161.0,78.0],[161.0,77.5]],[[202.5,66.0],[192.5,73.0],[187.0,79.0],[186.0,81.0],[185.0,82.0],[184.5,81.5],[179.0,90.0],[175.0,101.5],[180.0,91.5],[187.5,81.5],[197.0,72.0],[204.5,68.0]],[[204.5,56.0],[201.0,59.0],[202.5,59.0],[203.5,59.5],[203.5,60.5],[204.0,60.5],[205.0,59.0],[205.0,58.0],[204.0,57.0]]],"open":[[[52.0,236.0],[88.0,214.0],[102.0,196.0],[116.0,180.0],[138.0,168.0],[163.0,165.0],[184.0,167.0],[204.0,161.0],[229.0,158.0],[254.0,161.0],[275.0,169.0],[292.0,180.0],[306.0,194.0],[320.0,208.0],[350.0,222.0]]]},"cloud":{"outer":[[[69.5,154.0],[69.5,157.0],[71.5,162.5],[75.0,167.0],[79.5,170.0],[74.0,176.5],[70.5,184.0],[70.0,187.0],[70.0,195.0],[71.5,200.5],[75.0,207.0],[80.5,212.5],[91.0,217.5],[92.0,220.0],[95.0,223.0],[97.0,222.5],[102.0,217.0],[110.5,219.5],[118.0,219.5],[119.5,219.0],[119.5,217.5],[117.0,213.0],[115.0,206.5],[115.0,196.5],[115.5,192.5],[116.5,192.0],[119.5,193.5],[129.0,196.0],[137.0,196.0],[137.5,193.5],[135.0,188.0],[133.5,183.0],[134.0,177.0],[135.5,173.5],[137.0,175.0],[140.5,182.5],[148.0,190.5],[159.5,196.5],[164.0,198.0],[177.5,197.5],[183.0,196.0],[184.0,195.0],[183.5,193.0],[179.0,189.0],[173.5,179.5],[173.0,168.0],[174.0,166.5],[175.5,167.0],[178.0,173.0],[183.5,180.0],[185.0,180.5],[189.5,185.5],[198.5,189.5],[207.0,191.5],[216.0,191.5],[227.5,188.0],[229.0,186.5],[229.0,184.5],[223.5,181.5],[220.5,178.0],[216.0,171.0],[213.0,162.0],[213.0,159.5],[214.0,158.5],[217.5,160.0],[220.5,162.5],[229.0,165.5],[238.0,166.0],[247.0,164.5],[248.0,165.5],[248.0,167.5],[250.5,173.0],[254.0,179.0],[257.0,182.5],[264.0,188.0],[269.5,191.0],[277.0,193.0],[291.0,193.0],[291.5,193.5],[291.0,195.5],[294.5,201.0],[296.0,204.5],[297.0,210.5],[297.5,216.5],[301.5,220.0],[306.0,219.5],[316.0,214.5],[322.0,208.5],[324.0,206.0],[327.0,195.5],[327.0,188.0],[324.5,179.5],[331.5,176.5],[337.0,171.5],[340.0,167.0],[342.5,159.5],[342.5,158.0],[341.5,157.0],[337.5,158.0],[331.0,158.0],[327.5,157.5],[323.0,155.5],[313.5,149.0],[306.5,138.0],[298.0,128.5],[296.0,127.5],[295.5,126.0],[297.0,122.5],[296.5,120.5],[294.5,120.0],[288.0,122.0],[284.0,122.0],[273.0,119.0],[267.5,115.5],[267.0,114.0],[262.0,106.5],[254.0,98.5],[245.0,92.5],[232.5,88.0],[225.0,86.5],[217.0,86.5],[216.5,85.5],[217.5,84.0],[222.5,82.0],[222.5,80.5],[221.5,79.5],[207.0,76.5],[198.0,76.5],[193.5,77.0],[182.5,80.0],[174.5,84.0],[166.5,90.0],[163.5,86.5],[158.5,76.0],[156.0,74.5],[145.5,78.0],[138.0,82.0],[136.5,83.5],[136.5,85.0],[142.5,98.0],[143.5,101.5],[143.0,103.0],[137.0,105.0],[130.5,108.0],[124.0,112.5],[114.5,122.0],[109.5,129.0],[107.0,134.0],[106.0,135.0],[103.0,135.5],[96.0,144.0],[90.5,148.5],[81.0,153.5],[75.5,153.5],[71.0,153.0]]],"shadows":[[[71.5,196.5],[71.0,198.5],[73.5,204.5],[75.5,207.0],[79.0,209.0],[80.5,212.5],[91.0,217.5],[95.0,222.5],[97.0,222.0],[99.0,220.5],[99.5,218.0],[90.5,209.0],[86.0,195.5],[85.0,195.0],[83.5,196.5],[81.5,205.0],[80.5,204.5],[73.5,196.5]],[[326.5,191.0],[324.5,191.0],[321.0,199.0],[314.0,205.0],[312.5,204.5],[311.5,197.0],[309.0,192.5],[307.0,194.0],[307.5,201.5],[305.5,203.0],[299.0,197.5],[293.0,195.5],[292.5,197.5],[296.0,204.5],[298.0,217.0],[301.5,220.0],[305.5,219.5],[316.5,214.0],[321.5,209.0],[325.0,203.5],[327.0,195.0]],[[102.0,182.0],[101.5,184.5],[107.0,195.5],[111.0,200.0],[114.0,200.5],[115.0,193.0],[109.5,189.0],[103.5,182.0]],[[131.5,165.5],[130.0,168.0],[130.0,177.0],[131.0,181.5],[132.5,182.0],[134.0,180.5],[135.0,173.5],[133.5,166.5]],[[340.0,162.0],[338.5,162.5],[330.5,168.0],[321.5,171.0],[321.5,173.0],[325.5,178.5],[327.5,178.5],[331.5,176.5],[336.5,172.0],[340.5,165.5]],[[170.0,159.5],[168.5,161.0],[168.5,169.5],[170.0,175.5],[172.0,177.0],[173.0,175.5],[173.0,166.5],[171.5,160.5]],[[290.5,140.5],[287.0,139.5],[280.5,144.5],[274.5,146.5],[271.0,147.0],[267.5,144.5],[265.0,145.0],[265.0,147.5],[268.5,150.0],[268.0,153.0],[259.0,161.5],[249.0,166.5],[249.5,170.5],[252.0,171.5],[266.0,164.5],[270.5,159.5],[270.0,154.5],[271.0,153.5],[283.5,153.5],[284.5,152.0],[283.5,149.5],[289.5,143.5]],[[190.5,109.0],[188.0,108.0],[180.5,111.0],[179.0,112.5],[180.0,115.0],[181.0,116.5],[183.0,116.0],[190.0,111.0]]],"strands":[[[285.5,153.0],[285.5,153.5],[284.5,154.5],[290.0,158.5],[287.5,154.5]],[[205.0,146.5],[204.5,147.5],[206.5,152.0],[210.5,157.0],[211.0,157.0],[212.0,155.5],[213.0,155.5]],[[191.0,108.5],[192.0,109.0],[191.5,110.0],[192.5,110.5],[198.5,109.0],[198.0,108.5],[195.0,108.0]],[[168.0,103.0],[168.0,103.5],[169.0,103.5],[169.0,105.0],[170.0,105.5],[169.0,106.0],[170.0,106.5],[170.0,105.5],[171.0,105.5],[172.0,107.0],[170.5,106.5],[174.0,108.5],[177.5,112.0],[178.5,112.0],[179.0,110.5],[176.5,107.5],[171.5,104.0]],[[205.5,87.5],[204.0,87.5],[199.5,90.0],[194.0,94.0],[188.5,97.5],[182.5,104.0],[181.0,108.0],[180.5,110.0],[181.0,110.0],[182.5,109.0],[187.5,102.0],[193.0,96.0],[196.5,94.0],[206.0,89.5],[206.5,89.0],[205.5,88.5]]],"inks":[[[89.0,188.0],[87.5,191.0],[87.5,196.0],[89.5,205.0],[91.5,209.0],[97.0,215.0],[99.5,217.0],[101.5,215.0],[99.0,213.0],[94.0,208.0],[92.5,204.5],[91.5,204.0],[91.5,203.0],[90.5,201.0],[90.5,199.5],[89.5,199.5],[89.0,194.5]],[[304.5,185.5],[305.5,189.5],[306.0,198.5],[305.5,198.5],[301.5,195.0],[298.0,193.0],[294.0,192.0],[293.0,192.0],[293.5,195.0],[299.5,197.0],[302.5,199.5],[305.0,203.0],[305.5,203.0],[307.0,201.5],[306.5,198.5],[306.5,192.5],[306.0,191.0],[306.0,189.0],[306.5,188.5]],[[314.0,168.0],[313.5,168.5],[319.0,173.5],[322.5,179.0],[324.5,177.0],[323.5,175.5],[318.5,170.5]],[[87.0,165.5],[80.5,167.5],[81.5,170.0]],[[76.0,164.0],[76.5,165.0],[79.0,167.0],[80.5,165.5],[81.5,165.5],[77.5,163.0],[77.0,163.5],[77.5,164.0],[77.0,164.5]],[[100.0,157.5],[100.0,159.5],[99.0,158.5],[98.5,158.5],[98.5,165.0],[99.5,172.5],[105.0,183.5],[110.0,189.0],[114.0,191.5],[116.0,189.5],[112.0,187.0],[108.5,183.5],[105.0,179.0],[103.5,175.5],[101.0,167.0]],[[268.5,149.0],[268.0,149.5],[265.5,149.0],[262.0,154.5],[258.0,158.0],[254.0,160.5],[248.5,162.5],[250.5,165.5],[252.5,165.0],[255.5,163.5],[261.5,159.0],[267.0,152.5]],[[140.5,143.5],[137.0,148.5],[132.5,159.5],[132.5,161.0],[133.5,160.0],[134.0,161.0],[134.5,172.0],[137.5,172.0],[136.0,164.5],[136.0,157.5],[138.0,149.5]],[[175.5,140.0],[172.0,148.5],[172.5,165.0],[176.0,164.5],[174.0,154.0],[174.0,147.0]],[[285.5,139.0],[285.0,139.0],[278.5,142.0],[269.0,144.5],[270.0,146.5],[270.5,146.5],[277.0,145.5],[283.0,142.5],[285.5,140.0]],[[107.0,137.0],[105.0,137.0],[103.5,140.0],[102.0,146.0],[100.5,149.0],[99.5,154.0],[100.0,154.0],[100.5,152.5],[100.5,153.5],[101.0,153.0],[102.5,148.0]],[[243.0,133.0],[246.5,138.0],[252.5,144.0],[258.5,147.0],[262.5,148.0],[264.5,148.0],[264.0,146.0],[265.0,144.5],[262.5,144.5],[262.5,144.0],[259.0,144.0],[259.0,143.5],[260.0,143.0],[251.0,139.5]],[[166.5,92.0],[164.0,91.0],[160.5,95.0],[158.0,100.0],[149.5,100.0],[146.0,100.5],[145.5,101.0],[145.5,103.5],[152.0,102.5],[161.0,103.0],[168.5,105.0],[166.5,103.5],[167.5,103.0],[166.0,102.5],[161.0,101.0],[162.0,98.0]],[[215.0,83.5],[211.0,84.0],[207.5,86.0],[208.0,86.5],[209.5,86.0],[210.0,86.5],[209.5,87.5],[208.0,88.5],[215.0,88.0],[214.5,86.5],[214.5,84.5],[213.5,84.5]]]}};
+const HAIR_BACK_TRACE = {"straight":{"outer":[[[118.0,204.0],[114.0,209.0],[114.0,232.0],[115.0,249.5],[102.5,250.0],[101.0,246.5],[91.0,235.5],[89.0,235.5],[87.5,238.5],[84.0,279.0],[78.0,318.5],[68.5,365.0],[54.0,418.5],[49.5,443.0],[49.5,462.0],[51.0,470.5],[54.5,483.0],[61.5,495.5],[71.0,506.5],[73.0,506.5],[68.5,480.0],[68.5,462.5],[70.5,464.0],[71.0,469.0],[70.5,472.5],[72.5,475.5],[79.0,492.5],[81.0,493.0],[83.5,491.5],[86.5,487.5],[87.0,475.5],[85.5,473.0],[91.0,469.5],[89.0,451.0],[97.5,437.5],[114.5,461.0],[116.5,460.0],[131.5,437.5],[133.0,438.0],[148.5,461.0],[150.0,460.5],[166.0,437.5],[182.5,461.0],[184.0,460.5],[199.5,437.5],[216.5,461.0],[218.5,460.0],[233.5,437.5],[235.0,438.0],[250.5,461.0],[252.0,460.5],[268.0,437.5],[284.0,460.5],[285.5,461.0],[302.0,437.5],[309.0,447.5],[309.5,457.0],[299.0,490.0],[299.5,500.0],[295.0,501.0],[287.5,514.0],[286.0,520.0],[283.0,525.0],[283.0,527.5],[284.5,528.0],[298.0,521.0],[299.5,516.5],[304.5,516.5],[313.0,507.0],[322.5,491.5],[326.0,480.5],[328.0,469.0],[330.0,466.0],[332.0,468.0],[332.0,482.5],[330.0,494.0],[325.5,506.5],[325.0,511.0],[327.0,511.0],[339.0,497.0],[348.0,478.0],[350.0,469.0],[350.0,438.0],[345.5,416.0],[335.5,376.0],[332.0,369.0],[326.5,345.0],[318.5,297.5],[312.5,236.5],[309.5,236.5],[299.0,247.0],[298.0,250.0],[286.5,249.5],[288.0,234.0],[292.0,230.5],[297.5,232.0],[298.0,229.0],[294.5,226.5],[290.5,222.0],[291.0,212.5],[284.0,205.0],[281.5,204.0],[279.0,206.0],[273.0,208.5],[271.5,220.5],[265.0,236.5],[267.5,240.5],[274.0,239.0],[276.5,239.5],[276.5,246.0],[274.5,250.0],[127.0,250.0],[125.0,245.5],[125.0,240.0],[127.0,239.0],[130.5,240.5],[135.0,240.5],[136.0,239.5],[136.0,237.0],[131.0,227.0],[128.0,215.5],[128.0,208.5],[123.0,206.5],[120.0,204.0]]]},"wavy":{"outer":[[[72.5,200.5],[69.0,206.0],[67.5,211.0],[67.5,221.0],[71.5,230.0],[80.0,238.0],[79.5,249.0],[74.5,257.5],[69.0,263.0],[59.5,268.5],[52.0,275.5],[46.0,284.5],[43.0,293.0],[43.0,304.5],[47.0,314.5],[52.0,321.5],[61.0,329.5],[63.5,335.5],[66.0,338.0],[63.0,345.5],[59.5,347.0],[53.5,351.0],[43.5,362.0],[40.0,367.5],[37.0,377.0],[38.0,390.0],[43.5,401.0],[51.5,409.0],[60.5,414.0],[67.0,415.0],[71.0,419.5],[70.5,420.5],[66.0,422.0],[65.5,431.0],[62.5,438.5],[55.5,445.0],[50.5,455.0],[49.0,467.0],[51.0,475.0],[55.0,482.0],[57.5,484.5],[60.5,485.0],[62.5,489.0],[66.5,491.0],[68.0,490.5],[68.5,474.5],[71.5,467.0],[73.5,464.5],[75.0,464.5],[75.0,482.0],[77.0,489.0],[82.5,497.5],[93.0,506.0],[98.5,508.5],[101.0,508.5],[104.0,511.0],[112.5,515.0],[114.0,514.0],[113.5,510.0],[101.0,498.0],[100.5,483.5],[101.5,458.5],[99.5,458.0],[97.0,460.0],[94.5,459.5],[92.0,464.0],[90.5,463.0],[91.5,453.0],[90.0,450.0],[97.0,443.5],[98.5,438.5],[115.0,461.0],[132.5,437.5],[149.0,461.0],[166.5,437.5],[183.0,461.0],[200.5,437.5],[217.0,461.0],[234.5,437.5],[251.0,461.0],[268.5,437.5],[285.0,461.0],[302.0,438.0],[308.5,448.5],[311.5,456.5],[311.0,473.0],[304.0,482.0],[298.5,491.0],[298.5,506.5],[302.5,509.0],[305.0,508.0],[308.5,498.5],[309.5,497.5],[314.5,497.5],[323.0,489.0],[328.0,481.0],[331.5,467.5],[331.5,458.0],[330.0,453.0],[331.0,451.0],[333.0,452.0],[338.5,463.0],[338.5,475.5],[341.5,475.5],[352.0,463.5],[352.0,427.5],[341.0,415.5],[329.0,408.0],[325.0,403.5],[322.0,402.5],[323.0,396.5],[327.5,388.5],[352.0,363.0],[352.0,314.0],[341.0,303.0],[321.0,289.0],[314.0,271.5],[315.0,261.5],[316.5,257.5],[324.5,245.5],[329.0,241.5],[337.5,226.0],[339.0,220.0],[339.0,207.5],[337.0,201.0],[336.0,200.0],[304.0,200.5],[304.0,203.5],[312.0,209.5],[308.5,212.5],[309.0,224.5],[308.0,231.0],[310.0,234.0],[304.0,242.5],[299.0,246.5],[298.0,250.0],[286.5,249.5],[291.0,226.5],[292.5,201.0],[291.0,200.0],[276.5,200.0],[276.5,205.0],[273.0,208.5],[272.0,216.5],[269.0,227.5],[265.0,236.5],[265.0,239.5],[270.5,240.5],[278.5,238.0],[278.0,246.0],[276.0,250.0],[123.5,250.0],[120.5,242.0],[120.0,237.5],[130.5,240.5],[133.0,240.5],[135.0,237.5],[128.5,220.0],[127.0,208.5],[123.0,205.5],[124.5,204.0],[128.0,203.5],[128.5,200.5]]]},"wolf":{"outer":[[[101.5,200.0],[100.5,205.0],[104.5,220.0],[110.5,231.5],[115.5,238.0],[114.5,240.5],[114.5,249.0],[113.5,250.0],[102.0,250.0],[100.5,246.5],[95.0,241.0],[93.0,241.0],[87.5,249.5],[82.0,254.5],[81.5,257.5],[83.0,259.5],[89.5,261.5],[115.0,261.5],[116.5,269.5],[104.0,273.5],[99.0,291.0],[91.0,305.5],[81.0,316.0],[76.0,319.0],[67.5,322.5],[67.5,325.5],[72.5,328.0],[78.5,329.5],[90.5,329.5],[91.0,330.5],[76.5,356.5],[67.0,370.0],[58.5,378.0],[46.5,385.5],[47.0,388.5],[53.0,391.0],[72.0,392.5],[65.0,406.0],[62.5,414.5],[58.5,435.0],[60.0,450.5],[66.5,466.5],[67.5,467.5],[70.0,466.5],[70.0,461.0],[73.0,449.0],[76.0,443.0],[82.0,450.0],[84.0,467.5],[88.0,478.5],[92.0,486.0],[99.0,494.0],[101.0,494.0],[102.0,493.0],[102.0,471.5],[103.5,455.0],[106.5,439.5],[107.5,439.0],[114.0,448.5],[116.0,449.0],[131.5,425.5],[148.5,449.0],[150.0,448.5],[166.0,425.5],[182.5,449.0],[184.0,448.5],[199.5,425.5],[201.0,426.0],[216.5,449.0],[218.0,448.5],[233.5,425.5],[250.0,448.5],[251.5,449.0],[268.5,425.5],[284.5,449.0],[286.0,449.0],[292.0,439.5],[293.5,439.5],[298.0,467.0],[298.0,494.5],[299.0,495.5],[300.5,495.5],[309.5,481.0],[318.0,459.0],[318.0,450.0],[323.0,444.0],[324.5,443.5],[327.5,451.0],[329.5,468.0],[333.0,467.5],[338.5,455.5],[340.5,445.5],[340.5,428.0],[336.0,410.0],[328.0,392.5],[347.5,391.0],[352.5,389.0],[353.5,385.5],[340.5,377.5],[333.5,370.5],[322.0,353.5],[309.5,330.0],[320.0,329.5],[327.0,328.0],[331.5,325.5],[332.0,322.5],[318.0,315.5],[309.5,306.5],[300.0,289.0],[295.5,271.5],[295.5,265.0],[285.0,263.5],[286.0,262.5],[307.5,262.5],[313.5,261.0],[318.0,257.5],[318.0,254.5],[314.0,251.0],[307.5,241.0],[302.0,244.0],[299.5,246.5],[298.0,250.0],[287.5,250.0],[286.5,249.0],[287.0,240.5],[285.5,238.0],[291.5,229.0],[296.0,219.0],[298.5,209.0],[298.0,200.5],[275.5,200.0],[274.5,201.0],[275.0,203.0],[277.5,205.5],[273.5,208.5],[272.0,219.5],[268.5,229.0],[264.5,236.5],[264.5,239.5],[267.0,241.0],[275.5,239.5],[277.0,245.0],[275.0,250.0],[126.0,250.0],[124.5,248.5],[124.0,245.5],[125.0,240.0],[133.5,240.5],[134.5,239.5],[134.5,235.0],[128.0,217.5],[127.0,208.5],[119.0,205.0],[118.0,200.0]]]}};
+
+/* ---- hair.js ---- */
+/* ===== hair.js — 前发 / 后发 (front hair and back hair) =====
+   前发 (front hair): '天然' keeps the species' own little tuft; the six short styles are traced from the hairstyle
+   reference sheet (hair_data.js) on the fox head and moved onto the wearer's skull (TOON_HEADS), so one drawing fits
+   all seven species. They are drawn over the face and brows (layer hairFront).
+   后发 (back hair): long hair hanging behind the head, body and arms (layer hairBack, in head coordinates and bobbing
+   with the head). Only its outline is traced from the long-hair references; it is shaded with one top-to-bottom
+   gradient. A back style can only be worn together with a front style.
+   Look: one ink line, flat fill in the fur colour, darker strands and cel shadow inside, no white shine. */
+const HAIRS = [];
+const HAIR_INDEX = {};
+const HAIR_STYLES = {};
+function hairDef(id, name, tags, o = {}) {
+  const h = { id, name, tags, lift: o.lift || 0 };
+  HAIRS.push(h); HAIR_INDEX[id] = h;
+  if (o.draw) HAIR_STYLES[id] = Object.assign(h, { draw: o.draw });
+}
+const BACK_HAIRS = [];
+const BACK_INDEX = {};
+function backDef(id, name, tags, draw) { const h = { id, name, tags, draw }; BACK_HAIRS.push(h); BACK_INDEX[id] = h; }
+/* under a hat that covers the head, hair above this line (head coordinates) is tucked inside the hat */
+const HAIR_CUT = 150;
+
+/* the wearer's head, for hair: skull top T, and conversions from body coordinates (for long hair) */
+function hairFit(st, K) {
+  const kind = headKindOf(st);
+  return { kind, K, T: TOON_HEADS[kind].right[0][1] };
+}
+const hairInk = F => mix(F.main, F.line, .62);
+
+/* move a point traced on the fox head onto the wearer's skull: offsets inside the skull scale with its width,
+   hair beyond the skull keeps its overhang, and the crown follows the skull top */
+function warpTo(H) {
+  if (H.kind === 'fox') return p => p;
+  const Tf = TOON_HEADS.fox.right[0][1], dT = H.T - Tf;
+  return ([x, y, c]) => {
+    const yy = clamp(y, Tf, 290), sf = skullX('fox', yy) - 200, sk = skullX(H.kind, yy) - 200;
+    const d = x - 200, ad = Math.abs(d);
+    const nd = ad <= sf ? ad * sk / sf : sk + (ad - sf);
+    const ny = y < 224 ? y + dT * clamp((224 - y) / (224 - Tf), 0, 1.3) : y;
+    return [r1(200 + Math.sign(d) * nd), r1(ny), c];
+  };
+}
+/* a hand-inked stroke along a polyline: widest in the middle, tapering to points at both ends */
+function taperD(pts, w) {
+  const sp = samplePolyline(smoothPts(pts), 2.5, 4), n = sp.length;
+  if (n < 3) return '';
+  const N = normals(sp), L = [], R = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1), ww = w * Math.pow(Math.sin(Math.PI * t), .6);
+    L.push([sp[i].x + N[i].x * ww, sp[i].y + N[i].y * ww]); R.push([sp[i].x - N[i].x * ww, sp[i].y - N[i].y * ww]);
+  }
+  return smooth([[sp[0].x, sp[0].y, 1], ...L.slice(1, -1), [sp[n - 1].x, sp[n - 1].y, 1], ...R.slice(1, -1).reverse()]);
+}
+/* Catmull-Rom points of an open polyline (so a simplified trace bends smoothly) */
+function smoothPts(pts) {
+  if (pts.length < 3) return pts;
+  const out = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    for (let k = 0; k < 4; k++) {
+      const t = k / 4, t2 = t * t, t3 = t2 * t;
+      const f = (a, b, c, d) => .5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+      out.push([f(p0[0], p1[0], p2[0], p3[0]), f(p0[1], p1[1], p2[1], p3[1])]);
+    }
+  }
+  out.push(pts[pts.length - 1]);
+  return out;
+}
+/* x of the left- or rightmost crossing of the polygons at height y (null if none) */
+function polyEdgeX(polys, y, side) {
+  let best = null;
+  for (const P of polys) for (let i = 0; i < P.length; i++) {
+    const a = P[i], b = P[(i + 1) % P.length];
+    if ((a[1] - y) * (b[1] - y) > 0 || a[1] === b[1]) continue;
+    const x = a[0] + (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]);
+    if (best === null || (side < 0 ? x < best : x > best)) best = x;
+  }
+  return best;
+}
+/* fur filling the gap between the hair and the side of the skull, on both sides, down to the temples */
+function gapFill(H, polys, F) {
+  const T = TOON_HEADS[H.kind].right[0][1] + 6;
+  let d = '';
+  for (const side of [-1, 1]) {
+    const outer = [], inner = [];
+    for (let y = T; y <= 208; y += 3) {
+      const hx = polyEdgeX(polys, y, side), sk = 200 + side * (skullX(H.kind, y) - 200);
+      // a tuft flaring far out from the head leaves a gap open to the background: filling it drew a flat patch of fur
+      // with no outline, so only narrow gaps (hair lying close along the skull) are filled
+      const gap = hx === null ? 0 : side * (hx - sk);
+      if (gap <= 1.5 || gap > 12) { if (outer.length) break; continue; }
+      outer.push([r1(hx - side * 1.6), y]); inner.push([r1(sk - side * 3), y]);
+    }
+    if (outer.length > 2) d += smooth([...outer, ...inner.reverse()].map(([x, y], i, a) => [x, y, i === 0 || i === a.length - 1 || i === outer.length - 1 || i === outer.length ? 1 : 0]));
+  }
+  return d ? path(d, { fill: F.main }) : '';
+}
+
+/* ---------- 前发 ---------- */
+/* a traced front style: the traced silhouette with the traced shading, strand strokes and inner ink lines inside it
+   (all closed shapes, so the hand-drawn taper of each stroke survives), plus optional hand-placed lines L
+   (L.s strands, L.k ink lines). D.open lists edges that melt into the forehead: no outline is drawn along them. */
+function tracedHair(ctx, F, H, D, L = {}, o = {}) {
+  const w = warpTo(H), P = pts => pts.map(w), shapes = list => list.map(s => smooth(P(s))).join('');
+  let inner = '';
+  if (D.shadows) inner += path(shapes(D.shadows), shadowFill(o.shadow ?? .22));
+  if (D.strands) inner += path(shapes(D.strands), { fill: hairInk(F) });
+  if (D.inks) inner += path(shapes(D.inks), { fill: F.line });
+  if (L.s) inner += path(L.s.map(l => taperD(P(l), o.strandW ?? 2)).join(''), { fill: hairInk(F) });
+  if (L.k) inner += path(L.k.map(l => taperD(P(l), o.inkW ?? 2.1)).join(''), { fill: F.line });
+  let lineMask = null;
+  if (D.open) {
+    const k = ctx.next('ho');
+    ctx.def(k, `<mask id="__ID__" maskUnits="userSpaceOnUse" x="-100" y="-100" width="600" height="600"><rect x="-100" y="-100" width="600" height="600" fill="#fff"/>${D.open.map(l => `<path d="${smooth(P(l), false)}" fill="none" stroke="#000" stroke-width="9" stroke-linecap="round"/>`).join('')}</mask>`);
+    lineMask = ctx.url(k);
+  }
+  // where the hair stands off the side of the skull (the reference heads are rounder than ours), fill the gap
+  // underneath with fur so the hair sits on the head instead of floating over the ears
+  const fillUnder = o.fillGap === false ? '' : gapFill(H, D.outer.map(P), F);
+  return fillUnder + D.outer.map(pts => {
+    const sid = ctx.shape(smooth(P(pts)));
+    return g(use(sid, { fill: F.main }) + inner, { 'clip-path': ctx.clipUse(sid) })
+      + use(sid, Object.assign({ fill: 'none', stroke: F.line, 'stroke-width': 2.6, 'stroke-linejoin': 'round' }, lineMask ? { mask: lineMask } : {}));
+  }).join('');
+}
+
+hairDef('none', '天然', []);
+/* 慵懒中分: curtain fringe parted in the middle; each side sweeps out and flicks up past the cheek.
+   Its strand and ink lines were placed by hand on the tracing. */
+const CURTAIN_LINES = {
+  s: [[[154.4, 130.8], [165.4, 119.3], [179, 112.5], [199.3, 108.8]], [[148, 140.7], [140, 151.2], [129.8, 161.4], [118, 171.5]],
+    [[151.9, 176.6], [143.4, 186.8], [134.1, 196.1]], [[220.3, 125.8], [228.8, 117.6], [242.4, 115.3], [254.2, 120.7], [260.2, 126.6]],
+    [[278.8, 152.9], [286.4, 163.9], [296.6, 174.9], [305.1, 182.5]], [[261.9, 186.8], [266.1, 195.3]]],
+  k: [[[96.8, 196.6], [104.4, 198.6], [118, 200.7], [131.5, 200.3]], [[215.3, 125.8], [214.8, 138], [213.4, 149.5]]],
+};
+const frontStyle = (key, lines, o) => (ctx, st, F, H) => ({ front: tracedHair(ctx, F, H, HAIR_TRACE[key], lines, o) });
+hairDef('curtain', '慵懒中分', ['casual', 'vintage', 'street', 'cool'], { lift: 10, draw: frontStyle('curtain', CURTAIN_LINES, { fillGap: false }) });
+hairDef('swirl', '奶油旋卷', ['vintage', 'classic', 'elegant', 'preppy'], { lift: 16, draw: frontStyle('swirl') });
+hairDef('sweep', '轻盈侧扫', ['preppy', 'casual', 'office', 'sweet'], { lift: 8, draw: frontStyle('sweep') });
+hairDef('shag', '层叠短绒', ['street', 'casual', 'cool', 'sporty'], { lift: 10, draw: frontStyle('shag') });
+hairDef('swept', '疾风后掠', ['cool', 'street', 'sporty', 'party'], { lift: 22, draw: frontStyle('swept') });
+hairDef('cloud', '云朵刘海', ['cute', 'sweet', 'fantasy', 'casual'], { lift: 10, draw: frontStyle('cloud') });
+
+/* ---------- 后发 ---------- */
+/* traced (fox, girl) coordinates -> the wearer: around the head follow the skull, below the neck follow the body width */
+function warpBack(H) {
+  const sk = warpTo(H), K = H.K;
+  const kBody = (Math.max(K.hi, K.ch) + K.arm + 24) / 84;           // how far out the hanging arms are, vs the girl body
+  return ([x, y, c]) => {
+    const a = sk([x, y, c]), wHead = clamp((250 - y) / 40, 0, 1);
+    const f = lerp(1, kBody, clamp((y - 240) / 80, 0, 1));
+    return [r1(lerp(200 + (x - 200) * f, a[0], wHead)), r1(lerp(y, a[1], wHead)), c];
+  };
+}
+/* the skull cap of the back hair: a dome behind the head that meets the traced sheet where the sheet's (cut-off)
+   top begins, exactly as wide as the sheet there, its sides running down into the sheet */
+const BACK_TOP = 205, BACK_JOIN = 212;
+function backCap(H, polys) {
+  const T = TOON_HEADS[H.kind].right[0][1] - 7;
+  let half = 0;
+  for (const y of [BACK_TOP + 1, (BACK_TOP + BACK_JOIN) / 2, BACK_JOIN]) for (const sd of [-1, 1]) { const x = polyEdgeX(polys, y, sd); if (x !== null) half = Math.max(half, Math.abs(x - 200)); }
+  half = Math.max(half, skullX(H.kind, BACK_JOIN) - 200 + 8);
+  // the sheet flares out below the head: if the dome stayed as narrow as the sheet's top, the hair's outer edge
+  // curved in to the cheek with a notch under the front hair. So the dome is as wide as the sheet gets just below
+  // (per side), and each side runs straight down until it meets the sheet
+  const side = sd => { let w = half, yMeet = BACK_JOIN + 12;
+    for (let y = BACK_JOIN; y <= 262; y += 3) { const x = polyEdgeX(polys, y, sd); if (x === null) continue; const ww = Math.abs(x - 200);
+      if (ww > w) { w = ww; yMeet = y + 4; } }
+    return { w, yMeet }; };
+  const L = side(-1), R = side(1);
+  const b = BACK_JOIN - T, pts = [];
+  for (let i = 0; i <= 16; i++) { const a = Math.PI * i / 16, w = i < 8 ? L.w : i > 8 ? R.w : (L.w + R.w) / 2; pts.push([r1(200 - Math.cos(a) * w), r1(BACK_JOIN - Math.sin(a) * b)]); }
+  return smooth([[r1(200 - L.w), L.yMeet, 1], ...pts, [r1(200 + R.w), R.yMeet, 1], [r1(200 + R.w - 14), R.yMeet + 10, 1], [r1(200 - L.w + 14), L.yMeet + 10, 1]]);
+}
+
+/* the back hair: the traced sheet (its flat cut-off top hidden under the skull cap) and the cap, filled as one shape
+   (outlines under the fills, so no seam shows). It is behind the head and body, so all of it is in shadow: the
+   colour multiplied by the shadow lilac once (worked out here, as the hair is one flat colour); towards the
+   middle, behind the body, it deepens to a second multiply:
+   darkest in the middle, lighter towards the outer edges */
+function tracedBack(ctx, F, H, D) {
+  const w = warpBack(H);
+  const polys = D.outer.map(p => p.map(w));
+  const sheet = polys.map(p => smooth(p)), cap = backCap(H, polys);
+  const half = r1(Math.max(...polys.flat().map(p => Math.abs(p[0] - 200))));
+  const s1 = multiplyHex(F.main, SHADOW_TINT), s2 = multiplyHex(s1, SHADOW_TINT);
+  const gid = ctx.def(`bhg-${half}-${s1.slice(1)}`, `<linearGradient id="__ID__" gradientUnits="userSpaceOnUse" x1="${200 - half}" y1="0" x2="${200 + half}" y2="0"><stop offset="0" stop-color="${s1}"/><stop offset=".5" stop-color="${s2}"/><stop offset="1" stop-color="${s1}"/></linearGradient>`);
+  const ink = d => path(d, { fill: 'none', stroke: F.line, 'stroke-width': 5.2, 'stroke-linejoin': 'round' });
+  const fill = d => path(d, { fill: `url(#${gid})` });
+  const below = ctx.clip(`M-300,${BACK_TOP}H700V1400H-300Z`);
+  return ink(cap) + g(sheet.map(ink).join(''), { 'clip-path': below }) + fill(cap) + g(sheet.map(fill).join(''), { 'clip-path': below });
+}
+const backStyle = key => (ctx, st, F, H) => tracedBack(ctx, F, H, HAIR_BACK_TRACE[key]);
+backDef('none', '无', []);
+backDef('straight', '柔顺长直', ['elegant', 'sweet', 'classic', 'preppy'], backStyle('straight'));
+backDef('wavy', '蓬松长卷', ['sweet', 'elegant', 'vintage', 'party'], backStyle('wavy'));
+backDef('wolf', '层次狼尾', ['cool', 'street', 'casual', 'sporty'], backStyle('wolf'));
+
+/* ---------- drawing ---------- */
+/* is a back style worn? (only together with a front style) */
+const wearsBackHair = st => !!(st.hair && HAIR_STYLES[st.hair.id] && st.backHair && BACK_INDEX[st.backHair.id] && BACK_INDEX[st.backHair.id].draw);
+function drawHair(env, add) {
+  const { ctx, st, F, K } = env;
+  const S = st.hair && HAIR_STYLES[st.hair.id];
+  if (!S) return;
+  const H = hairFit(st, K);
+  const front = S.draw(ctx, st, F, H).front;
+  const back = wearsBackHair(st) ? BACK_INDEX[st.backHair.id].draw(ctx, st, F, H) : '';
+  const hat = st.wear && st.wear.hat && ITEM_INDEX.hat[st.wear.hat.id];
+  // under a hat that covers the head the top of the hair is tucked inside it. The cut runs level across the skull
+  // under the hat, then slopes down and out past the skull's sides, so the side tufts tuck up under the hat's edge
+  // instead of poking out beside it with a flat top; where the cut crosses the hair it gets the hair's ink line
+  let cut = null, cutInk = '';
+  if (hat && hat.covers) {
+    const y0 = HAIR_CUT + 14, w = skullX(H.kind, y0) - 200 + 1;
+    const edge = `M${r1(200 - w - 70)},${y0 + 70}L${r1(200 - w)},${y0}L${r1(200 + w)},${y0}L${r1(200 + w + 70)},${y0 + 70}`;
+    cut = ctx.clip(edge + 'L700,1400L-300,1400Z');
+    const D = HAIR_TRACE[st.hair.id];
+    if (D) { const wp = warpTo(H); cutInk = g(ln(edge, F.line, 5.2), { 'clip-path': ctx.clipAll(D.outer.map(q => smooth(q.map(wp)))) }); }
+  }
+  const keep = (s, ink = '') => cut ? g(s + ink, { 'clip-path': cut }) : s;
+  if (back) add('hairBack', `<g class="headgrp"><g transform="${HEAD_TF}">${keep(back)}</g></g>`);
+  let f = front;
+  // round bear ears and the deer's side ears would vanish into the hair: they grow out through it, so draw them
+  // again over the hair, except where the skull covers them
+  if (['bear', 'deer'].includes(headKindOf(st))) {
+    const k = ctx.next('em');
+    ctx.def(k, `<mask id="__ID__" maskUnits="userSpaceOnUse" x="-100" y="-100" width="600" height="600"><rect x="-100" y="-100" width="600" height="600" fill="#fff"/><path d="${toonHeadPath(headKindOf(st), '_hat', [])}" fill="#000"/></mask>`);
+    f += g(drawEars(ctx, st, F), { mask: ctx.url(k) });
+  }
+  add('hairFront', keep(f, cutInk));
+}
+
+/* ---- render.js ---- */
+/* ===== render.js — compose the character SVG from layers ===== */
+const SLOTS = ['top', 'bottom', 'dress', 'outer', 'socks', 'shoes', 'hat', 'glasses', 'neck', 'acc', 'held', 'back', 'face'];
+const ITEMS = {}; SLOTS.forEach(s => ITEMS[s] = []);
+const ITEM_INDEX = {};
+function indexItems() { for (const k of SLOTS) { ITEM_INDEX[k] = {}; for (const it of ITEMS[k]) { it.slot = k; ITEM_INDEX[k][it.id] = it; } } ITEM_INDEX.base = {}; for (const it of BASE_ITEMS) ITEM_INDEX.base[it.id] = it; }
+const BASE_ITEMS = [];
+
+const LAYERS = ['bgBack', 'tail', 'hairBack', 'hood', 'armsBack', 'legs', 'socks', 'shoes', 'torso', 'under', 'beltLow', 'over1', 'bib', 'dress', 'accMid',
+  'outer', 'accTop', 'neck', 'armsFront', 'ears', 'head', 'face', 'faceDeco', 'brows', 'hairFront', 'glasses', 'hat', 'top'];
+/* the whole head (with hats/glasses) is drawn a little larger, pivoting on the chin */
+const HEAD_SCALE = 0.94, HEAD_Y = 283, HEAD_TF = `translate(200,${HEAD_Y}) scale(${HEAD_SCALE}) translate(-200,-290)`;
+const GLOVE_AT = .55;     // where the dark fur glove starts along the arm (0 = shoulder)
+const HEAD_LAYERS = new Set(['ears', 'head', 'face', 'faceDeco', 'hairFront', 'brows', 'glasses', 'hat']);
+
+/* resolve an equipped item into a full "it" object with colors */
+function itemOf(slot, w) {
+  if (!w) return null;
+  const def = (ITEM_INDEX[slot] || {})[w.id] || (ITEM_INDEX.base || {})[w.id];
+  if (!def) return null;
+  return { def, id: w.id, c1: w.c1 || def.c1, c2: w.c2 || def.c2 || def.c1, pat: w.pat ?? def.pat ?? 'none', pc: w.pc || def.pc || '#ffffff', tuck: w.tuck ?? def.tuck ?? false };
+}
+
+function renderCharacter(st, opts = {}) {
+  const ctx = makeCtx(opts.id || 'm');
+  const K = buildGeom(st);
+  const F = furColors(st);
+  const L = {};
+  const add = (k, s) => { if (s) (L[k] = L[k] || []).push(s); };
+  const W = st.wear || {};
+  const I = {}; for (const s of SLOTS) I[s] = itemOf(s, W[s]);
+  const dress = I.dress;
+  const top = I.top && (!dress || dress.def.overTop) ? I.top : null;
+  const bottom = I.bottom && !dress ? I.bottom : null;
+  const effTop = top || (!dress ? itemOf('base', { id: 'basetank' }) : null);
+  const effBottom = bottom || (!dress ? itemOf('base', { id: 'baseshorts' }) : null);
+  const env = { ctx, K, F, st, coverArms: !!(I.outer && I.outer.def.coversArms) };
+  const sleeveList = [effTop, dress, I.outer].filter(it => it && it.def.sleeve);
+  env.sleeveSets = new Map([K.armL, K.armR].map(arm => [arm, visibleSleeves(arm, K, sleeveList)]));
+  const masks = new Map();
+  for (const it of sleeveList) masks.set(it, armholeMasks(ctx, K, it, [K.armL, K.armR].map(arm => {
+    const v = env.sleeveSets.get(arm).find(x => x && x.it === it);
+    return v ? v.G : null;
+  })));
+
+  // run item draws
+  const put = (it, defLayer) => {
+    if (!it) return;
+    it.pc = it.pc || '#fff';
+    it.patUrl = it.pat && it.pat !== 'none' ? ctx.pattern(it.pat, it.pc, it.c1) : null;
+    PAINT_MASK = masks.get(it) || null;
+    let r = it.def.draw(env, it) || '';
+    PAINT_MASK = null;
+    if (typeof r === 'string') r = { [defLayer]: r };
+    if (it.def.slot === 'neck') for (const k of ['main', defLayer]) if (r[k]) r[k] = castShadow(ctx, r[k], ctx.clip(chest)) + r[k];
+    for (const k in r) add(k === 'main' ? defLayer : k, r[k]);
+  };
+  /* where a garment's cast shadow may fall: only on fabric known to be under it, never on the background.
+     An untucked top and a jacket shade the hips of the trousers / skirt under their hem (garment(), jacket());
+     a jacket also shades the shirt in its opening, and neckwear the shirt it lies on. */
+  const hips = `M${CX - K.hi - 2},440H${CX + K.hi + 2}V500H${CX - K.hi - 2}Z`;
+  const chest = S(topRight(K, { neck: 'crew', ease: 4, hem: 470 }));
+  env.castOnHips = ctx.clip(hips);
+  env.castOnTop = ctx.clipAll([chest, hips]);
+  const tucked = effTop && effBottom && !effBottom.def.noTuck && (effTop.tuck || effBottom.def.forceTuck);
+  K.tucked = !!tucked;
+  if (effBottom) put(effBottom, tucked ? 'over1' : 'under');
+  if (effTop) put(effTop, tucked ? 'under' : 'over1');
+  put(dress, 'dress');
+  put(I.outer, 'outer');
+  put(I.socks, 'socks');
+  put(I.shoes, 'shoes');
+  put(I.hat, 'hat');
+  put(I.glasses, 'glasses');
+  put(I.neck, I.neck && I.neck.def.underJacket && I.outer && I.outer.def.closed ? 'accMid' : 'neck');
+  if (I.acc) put(I.acc, I.acc.def.layer === 'belt' ? (tucked || !effTop ? 'bib' : 'beltLow') : (I.acc.def.layer || 'accMid'));
+  put(I.back, 'bgBack');
+  put(I.face, 'faceDeco');
+
+  // body
+  add('tail', drawTail(ctx, st, F, K));
+  const barePaws = !I.shoes;
+  add('legs', drawLegs(ctx, st, F, K, barePaws) + (barePaws ? '' : drawFeet(ctx, K, F.foot)));
+  // where a bare arm meets the body the two share one outline: hide the torso outline over the shoulder caps
+  const zx = K.sh - 16, box = 'x="-60" y="-60" width="520" height="840"';
+  const zone = ctx.def(`azone-${zx}`, `<clipPath id="__ID__" clipPathUnits="userSpaceOnUse"><path d="M-60,-60H${CX - zx}V351H-60ZM${CX + zx},-60H460V351H${CX + zx}Z"/></clipPath>`);
+  const caps = [K.armL, K.armR].map(a => `<path d="${armShape(a, K).d}" fill="#000"/>`).join('');
+  const tmask = ctx.def('tmask-' + ctx.next('t'), `<mask id="__ID__" maskUnits="userSpaceOnUse" ${box}><rect ${box} fill="#fff"/><g clip-path="url(#${zone})">${caps}</g></mask>`);
+  add('torso', drawTorso(ctx, st, F, K, `url(#${tmask})`));
+  // arms
+  const sleeves = [];
+  for (const it of [effTop, dress, I.outer]) if (it && it.def.sleeve) sleeves.push(it);
+  const heldIt = I.held;
+  if (heldIt && heldIt.def.grip === 'front') add('armsFront', drawHeld(env, heldIt, K.armR));
+  for (const arm of [K.armL, K.armR]) drawArm(env, arm, sleeves, heldIt, add);
+  // head
+  add('ears', drawEars(ctx, st, F));
+  add('head', drawHead(ctx, st, F));
+  add('face', drawEyes(ctx, st, F) + drawNose(st, F) + drawMouth(st, F) + drawBlush(ctx, st));
+  add('brows', drawBrows(st, F));
+  drawHair(env, add);
+
+  // assemble
+  const only = opts.only ? new Set(opts.only) : null;
+  let body = '', head = '';
+  for (const k of LAYERS) {
+    if (only && !only.has(k)) continue;
+    const s = (L[k] || []).join('');
+    if (!s) continue;
+    if (HEAD_LAYERS.has(k)) head += `<g data-l="${k}">${s}</g>`;
+    else body += `<g data-l="${k}">${s}</g>`;
+  }
+  // split: everything before 'ears' is body; head group goes after armsFront
+  const vb = opts.viewBox || '0 0 400 720';
+  const cls = opts.noAnim ? '' : ' class="char"';
+  const extra = opts.wh ? ` width="${opts.wh[0]}" height="${opts.wh[1]}"` : '';
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${vb}"${cls}${extra} preserveAspectRatio="xMidYMid meet"><defs>${ctx.defsMarkup()}</defs>${body}<g class="headgrp"><g transform="${HEAD_TF}">${head}</g></g></svg>`;
+}
+
+/* ---------- set-in sleeves ---------- */
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+function sleeveParts(arm, K, sl) {
+  const fur = armFurWidth(K);
+  const sp = sl.def.sleeve, len = Math.min(arm.len - 2, arm.len * sp.len);
+  const ease = sp.ease ?? 3;
+  const col = sp.color === 'c2' ? sl.c2 : sl.c1;
+  const sw = t => fur(t) + ease + (sp.taper ? (1 - t) * sp.taper : 0);
+  return { sp, len, col, sw, ease };
+}
+/* Every sleeved garment shares these armhole anchors (right side; mirrored for the left):
+   SH_IN sits just under the shoulder line, SH_PT just outside the shoulder point, ARMPIT just inside the side seam. */
+function armhole(K, side, outer) {
+  const X = dx => CX + side * dx;
+  // the same shoulder line as the garment outline (topRight / jacketPanel), so the sleeve continues it exactly
+  return outer
+    ? { shIn: { x: X(K.sh - 11), y: 301 }, shPt: { x: X(K.sh + 2), y: 309.5 }, pit: { x: X(K.ch + 3), y: 351 }, pitIn: { x: X(K.ch - 6), y: 346 } }
+    : { shIn: { x: X(K.sh - 12), y: 303.5 }, shPt: { x: X(K.sh + 1), y: 311 }, pit: { x: X(K.ch + 2), y: 351 }, pitIn: { x: X(K.ch - 6), y: 346 } };
+}
+/* Outline of a set-in sleeve. Its top edge carries on from the garment's shoulder line, its under edge starts at
+   the armpit, and the root lies inside the garment (which is painted over it). wMax: width of a sleeve worn over this one. */
+/* bend at the elbow: u1/u2 = upper arm / forearm directions, theta = inside angle (PI = straight),
+   n = unit vector into the crook of the elbow */
+function armBend(arm) {
+  const unit = (x, y) => { const l = Math.hypot(x, y) || 1; return { x: x / l, y: y / l }; };
+  const { S, E, W } = arm;
+  const u1 = unit(E.x - S.x, E.y - S.y), u2 = unit(W.x - E.x, W.y - E.y);
+  const theta = Math.PI - Math.acos(clamp(u1.x * u2.x + u1.y * u2.y, -1, 1));
+  let n = { x: u2.x - u1.x, y: u2.y - u1.y };
+  if (Math.hypot(n.x, n.y) < .08) n = { x: CX - E.x, y: 0 };
+  const u = unit(u1.x + u2.x, u1.y + u2.y), dt = n.x * u.x + n.y * u.y;
+  return { u1, u2, u, n: unit(n.x - u.x * dt, n.y - u.y * dt), theta };
+}
+/* widest the inside of a bent sleeve may be: its two inner edges must meet before the sleeve ends,
+   or the inner outline folds over itself (a spike). Infinity when the bend is gentle or the sleeve is short. */
+function bendCap(arm, K, P) {
+  const Lf = P.len - K.L1, B = armBend(arm);
+  if (Lf < 6 || B.theta > 2.6) return Infinity;
+  return Math.max(6, .8 * Lf * Math.tan(B.theta / 2));
+}
+function sleeveGeom(arm, K, P, wMax, outer) {
+  const side = arm.side;
+  const sp = samplePolyline(cutPolyline(arm.pts, P.len), 3, 12);
+  const N = normals(sp), n = sp.length, L = sp[n - 1].s || 1;
+  const flare = P.sp.flare || 0, puff = !!P.sp.puff;
+  const O = [], I = [];
+  // inside of a sharp elbow: squeeze that side near the bend (fabric bunches in the crook)
+  const cap = bendCap(arm, K, P);
+  let capI = false, reachUp = 0;
+  if (cap < Infinity) {
+    const B = armBend(arm), ie = Math.min(n - 1, Math.max(0, sp.findIndex(q => q.s >= K.L1)));
+    capI = side * N[ie].x * B.n.x + side * N[ie].y * B.n.y > 0;   // the I edge lies inside the bend
+    reachUp = cap / Math.tan(B.theta / 2) + 6;                     // how far up the upper arm the squeeze runs
+  }
+  const squeeze = (s, w) => cap === Infinity ? w : Math.min(w, cap + Math.max(0, K.L1 - reachUp - s) * .45);
+  for (let i = 0; i < n; i++) {
+    const s = sp[i].s, u = s / L;
+    let w = P.sw(s / arm.len);
+    if (wMax) w = Math.min(w, wMax(s / arm.len));
+    let wo = w, wi = w;
+    if (puff) {   // balloon that rises from the shoulder and is gathered into the cuff
+      const b = Math.sin(Math.PI * Math.min(1, (u + .14) / .94));
+      wo += 12 * b; wi += 5 * b;
+    } else {
+      const fl = flare * Math.pow(Math.max(0, (u - .4) / .6), 1.4);
+      wo += fl; wi += fl * .6;
+    }
+    if (cap < Infinity) { if (capI) wi = squeeze(s, wi); else wo = squeeze(s, wo); }
+    const ux = -side * N[i].x, uy = -side * N[i].y;   // towards the shoulder side of the arm
+    O.push({ x: sp[i].x + ux * wo, y: sp[i].y + uy * wo });
+    I.push({ x: sp[i].x - ux * wi, y: sp[i].y - uy * wi });
+  }
+  // armhole anchors join in only where they lie behind the shoulder joint (arm hanging down); on a raised arm
+  // the upper edge instead grows straight out of the shoulder line at the shoulder seam
+  const H = armhole(K, side, outer), S0 = sp[0], t0 = { x: N[0].tx, y: N[0].ty };
+  const behind = q => (q.x - S0.x) * t0.x + (q.y - S0.y) * t0.y < 0;
+  let top = [H.shIn, H.shPt].filter(behind);
+  const raised = !top.length;
+  if (raised) top = [H.shIn];
+  const shIn = Object.assign({}, H.shIn, { c: true });   // the garment's shoulder line runs straight into the sleeve here
+  let rounded = false;
+  if (!raised && !puff) {
+    // hanging arm: the shoulder line curves down into the sleeve's outer edge (one quadratic, tangent to both)
+    let j = 0; while (j < n - 2 && sp[j].s < 14) j++;
+    const Q = O[j], m = (H.shPt.y - H.shIn.y) / (H.shPt.x - H.shIn.x);
+    // control point = where the shoulder line meets the sleeve edge extended upwards, so both ends are tangent
+    const R2 = O[Math.min(n - 1, j + 3)], dx = Q.x - R2.x, dy = Q.y - R2.y;
+    let C = { x: Q.x, y: H.shIn.y + (Q.x - H.shIn.x) * m };
+    const den = dy - m * dx;
+    if (Math.abs(den) > 1e-6) {
+      const u = (H.shIn.y + (Q.x - H.shIn.x) * m - Q.y) / den;   // Q + u*(dx,dy) lies on the shoulder line
+      if (u > 0 && u < 40) C = { x: Q.x + u * dx, y: Q.y + u * dy };
+    }
+    const curve = [];
+    for (let k = 1; k < 7; k++) { const t = k / 7, a = (1 - t) * (1 - t), b = 2 * t * (1 - t), c = t * t; curve.push({ x: a * H.shIn.x + b * C.x + c * Q.x, y: a * H.shIn.y + b * C.y + c * Q.y }); }
+    O.splice(0, j, ...curve);
+    top = [];
+    rounded = true;
+  }
+  if (puff) {
+    // the outside of a puff is one round curve from the shoulder point to the cuff, fullest just above the cuff
+    const Pt = top.length ? top[top.length - 1] : O[0], Q = O[n - 1];
+    const e = n - 1, ux = -side * N[e].x, uy = -side * N[e].y;
+    const C = { x: Q.x + ux * 22 - N[e].tx * 18, y: Q.y + uy * 22 - N[e].ty * 18 };
+    for (let i = 0; i < n; i++) {
+      const t = (i + 1) / n, a = (1 - t) * (1 - t), b = 2 * t * (1 - t), c = t * t;
+      O[i] = { x: a * Pt.x + b * C.x + c * Q.x, y: a * Pt.y + b * C.y + c * Q.y };
+    }
+  }
+  let Oc = deloop(O), Ic = deloop(I);   // the inside of a bent elbow folds into a crease instead of a loop
+  if (raised && !puff) {
+    const a = H.shIn, b = H.shPt, slope = (b.y - a.y) / (b.x - a.x);
+    const under = q => q.y > a.y + (q.x - a.x) * slope - 1;
+    let k = 0; while (k < Oc.length - 3 && under(Oc[k])) k++;
+    Oc = Oc.slice(k);
+  }
+  Oc[Oc.length - 1].c = true; Ic[Ic.length - 1].c = true;
+  const head = rounded ? [shIn] : [shIn, ...top.slice(1)];
+  const pts = [...head, ...Oc, ...Ic.slice().reverse(), H.pit, H.pitIn];
+  // the part of the sleeve below arc length s0 as a plain tube, for the front pass of an arm that crosses the body
+  // (there the armhole closure above can fold back into view). It starts well above s0, where the front-pass clip
+  // cuts it off, and its outline is left open at that end, so neither the closing edge nor its ink can show.
+  const at = q => { let b = 0, bd = Infinity; for (let i = 0; i < n; i++) { const d2 = (sp[i].x - q.x) ** 2 + (sp[i].y - q.y) ** 2; if (d2 < bd) { bd = d2; b = i; } } return sp[b].s; };
+  const cut = s0 => {
+    const o = Oc.filter(q => at(q) >= s0 - 10), i2 = Ic.filter(q => at(q) >= s0 - 10);
+    if (o.length < 2 || i2.length < 2) return null;
+    const P2 = [Object.assign({}, o[0], { c: true }), ...o.slice(1), ...i2.slice().reverse()];
+    P2[P2.length - 1] = Object.assign({}, P2[P2.length - 1], { c: true });
+    const pts2 = P2.map(q => [q.x, q.y, q.c ? 1 : 0]);
+    return { d: smooth(pts2), open: smooth(pts2, false) };
+  };
+  return { d: smooth(pts.map(q => [q.x, q.y, q.c ? 1 : 0])), sp, O: Oc, I: Ic, L, cut };
+}
+/* Mask pair used while painting a sleeved garment: 'hide' removes the garment outline where its own sleeves
+   cover the armhole, 'seam' draws a thin armhole seam there instead. Only above the armpit and away from the collar. */
+function armholeMasks(ctx, K, it, geoms) {
+  const ds = geoms.filter(Boolean).map(G => G.d);
+  if (!ds.length) return null;
+  const zx = K.sh - 16, zy = 351;
+  const zone = ctx.def(`azone-${zx}`, `<clipPath id="__ID__" clipPathUnits="userSpaceOnUse"><path d="M-60,-60H${CX - zx}V${zy}H-60ZM${CX + zx},-60H460V${zy}H${CX + zx}Z"/></clipPath>`);
+  const box = 'x="-60" y="-60" width="520" height="840"';
+  const shapes = c => `<g clip-path="url(#${zone})">${ds.map(d => `<path d="${d}" fill="${c}"/>`).join('')}</g>`;
+  const hide = ctx.def('ahide-' + ctx.next('h'), `<mask id="__ID__" maskUnits="userSpaceOnUse" ${box}><rect ${box} fill="#fff"/>${shapes('#000')}</mask>`);
+  const seam = ctx.def('aseam-' + ctx.next('h'), `<mask id="__ID__" maskUnits="userSpaceOnUse" ${box}>${shapes('#fff')}</mask>`);
+  return { hide: `url(#${hide})`, seam: it.def.noSeam ? null : `url(#${seam})` };
+}
+/* which sleeves actually show on an arm: a sleeve is hidden by a longer one worn over it, and never pokes out
+   around a shorter one worn over it (it is clamped to that sleeve's width) */
+function visibleSleeves(arm, K, sleeves) {
+  const Ps = sleeves.map(it => sleeveParts(arm, K, it));
+  return sleeves.map((it, i) => {
+    const P = Ps[i];
+    if (P.len < 6) return null;
+    const over = Ps.slice(i + 1).filter(q => q.len >= 6);
+    if (over.some(q => q.len >= P.len - 2)) return null;
+    const wMax = over.length ? t => Math.min(...over.map(q => q.sw(t))) - .5 : null;
+    return { it, P, G: sleeveGeom(arm, K, P, wMax, ITEM_INDEX.outer[it.def.id] === it.def) };
+  });
+}
+
+/* draw one arm: fur, sleeves (top/dress/outer), held item, paw. Splits into back/front passes.
+   The arm (shoulder to paw) is ONE silhouette; the front pass is a clipped copy of the same drawing,
+   so there is no seam at the elbow and no separate hand blob. */
+function drawArm(env, arm, sleeves, heldIt, add) {
+  const { ctx, K, F, st } = env;
+  const spc = SPECIES[st.species];
+  const isItemArm = heldIt && K.itemArm === arm;
+  const ff = arm.frontFrom;
+  const front = ff > 0;
+  const splitS = frontSplit(arm, K);
+  const A = armShape(arm, K);
+  const aid = ctx.shape(A.d);
+  const glove = !!spc.paws;
+  // a gloved arm is filled dark and the fur-coloured upper arm is laid on top (one edge only: the zigzag)
+  const pawCol = glove ? F.acc : F.hand;
+  const pawInk = pawCol !== F.limb ? lineOf(pawCol) : F.limbLine;
+  let mark = '';
+  if (glove) mark = path(armUpperD(arm, K, arm.len * GLOVE_AT, A.wf), { fill: F.limb });
+  else if (F.hand !== F.limb) mark = path(A.pawFill, { fill: F.hand });
+  const furFill = use(aid, { fill: glove ? F.acc : F.limb });
+  let fur = mark ? g(furFill + mark, { 'clip-path': ctx.clipUse(aid) }) : furFill;
+  if (spc.stripes) fur += armStripes(ctx, arm, K, F, A.d);
+  fur += use(aid, { fill: 'none', stroke: F.limbLine, 'stroke-width': 2.7, 'stroke-linejoin': 'round' });
+  const pawDeco = A.creases ? ln(A.creases, pawInk, 2)
+    : A.pads ? path(A.pads.palm, { fill: F.pad }) + A.pads.toes.map(p => circ(p.x, p.y, A.pads.r, { fill: F.pad })).join('') : '';
+  fur += pawDeco;
+  let sl = '';
+  const vis = (env.sleeveSets.get(arm) || []).filter(Boolean);
+  for (const v of vis) sl += sleevePaint(ctx, v.G.d, null, v.it, v.P, arm, K, v.G);
+  if (vis.length) {
+    const hem = Math.max(...vis.map(v => v.P.len)) - 4;
+    if (hem < arm.len - 8) fur = g(fur, { 'clip-path': ctx.clipAll([armTube(arm, K, hem, arm.len, t => A.wf(t) + 14, 'flat', 'round').d, A.pawClip]) });
+    else fur = g(fur, { 'clip-path': ctx.clip(A.pawClip) });
+  }
+  let pawOver = path(A.pawFill, { fill: pawCol }) + path(A.pawLine, { fill: 'none', stroke: pawInk, 'stroke-width': 2.7, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }) + pawDeco;
+  if (vis.length) {
+    const k = ctx.next('pm');
+    ctx.def(k, `<mask id="__ID__" maskUnits="userSpaceOnUse" x="-300" y="-300" width="1000" height="1400"><rect x="-300" y="-300" width="1000" height="1400" fill="#fff"/>${vis.map(v => `<path d="${v.G.d}" fill="#000" stroke="#000" stroke-width="2.6"/>`).join('')}</mask>`);
+    pawOver = g(pawOver, { mask: ctx.url(k) });
+  }
+  const watch = st.wear && st.wear.acc && st.wear.acc.id === 'watch' && arm.side < 0 ? drawWatch(env, arm) : '';
+  let back = fur + sl;
+  if (!front) {
+    if (isItemArm && heldIt.def.grip !== 'front') back += drawHeld(env, heldIt, arm) + pawOver;
+    if (arm.hand === 'open') add('top', pawOver);
+    add('armsBack', back + watch);
+    return;
+  }
+  add('armsBack', back);
+  // front pass: the same drawing, clipped to the forearm and paw
+  // the clip must be wider than the widest sleeve, or the sleeve edge gets cut off where it meets the torso
+  const reach = Math.max(9, ...sleeves.map(it => { const P = sleeveParts(arm, K, it); return (P.sp.ease ?? 3) + (P.sp.flare || 0) + (P.sp.puff ? 14 : 0) + 5; }));
+  const foreClip = ctx.clipAll([armTube(arm, K, splitS, arm.len, t => A.wf(t) + reach, 'flat', 'round').d, A.pawClip]);
+  // an arm that crosses the body from the armpit (拿杯子) is cut just under it: there the sleeves are redrawn as plain tubes
+  const crossing = arm.cfg === 'cup';
+  const slF = crossing ? vis.map(v => { const c = v.G.cut(splitS); return c ? sleevePaint(ctx, c.d, c.open, v.it, v.P, arm, K, v.G) : ''; }).join('') : sl;
+  let fr = g(g(fur + slF, { opacity: .999 }), { 'clip-path': foreClip });
+  if (isItemArm && heldIt.def.grip !== 'front') fr += drawHeld(env, heldIt, arm) + pawOver;
+  add('armsFront', fr + watch);
+}
+/* where the front pass of an arm starts (arc length from the shoulder). Hands held together in front ('front' 捧手 /
+   捧花): the upper arm hangs clear of the body, so the arm comes in front of the clothes just above the elbow.
+   An arm raised across the chest ('cup' 拿杯子) is in front of the clothes from the armpit down; otherwise a straight
+   cut shows wherever the bodice hides the inside of the upper arm. The cut (square to the upper arm) passes just
+   under the armpit point, so the sleeve's whole inner edge is in front while its armhole corner stays behind. */
+function frontSplit(arm, K) {
+  if (arm.cfg === 'front') return Math.hypot(arm.E.x - arm.S.x, arm.E.y - arm.S.y) - 2;
+  if (arm.cfg !== 'cup') return arm.len * arm.frontFrom;
+  const { S, E } = arm, l = Math.hypot(E.x - S.x, E.y - S.y) || 1;
+  const pit = { x: CX + arm.side * (K.ch + 3), y: 351 };
+  const s = ((pit.x - S.x) * (E.x - S.x) + (pit.y - S.y) * (E.y - S.y)) / l - 1;
+  return clamp(s, 16, arm.len * arm.frontFrom);
+}
+function sleevePaint(ctx, d, open, sl, P, arm, K, G) {
+  const col = P.col, lc = lineOf(col);
+  const sid = ctx.shape(d);
+  let s = use(sid, { fill: col });
+  if (sl.patUrl && P.sp.color !== 'c2') s += use(sid, { fill: sl.patUrl });
+  let extra = '';
+  if (P.sp.puff && G) {   // gathers running into the cuff + a soft shadow on the underside
+    const at = (u, k) => {
+      const o = G.O[Math.round(u * (G.O.length - 1))], q = G.I[Math.round(u * (G.I.length - 1))];
+      return { x: lerp(q.x, o.x, k), y: lerp(q.y, o.y, k) };
+    };
+    let gd = '';
+    for (const k of [.3, .55, .8]) {
+      const a = at(.16, k), m = at(.45, k + (k - .55) * .3), b = at(.8, .5 + (k - .55) * .5);
+      gd += `M${r1(a.x)},${r1(a.y)}Q${r1(m.x)},${r1(m.y)} ${r1(b.x)},${r1(b.y)}`;
+    }
+    extra += ln(gd, lc, 1.4, { opacity: .45 });
+    const sh = [at(.1, 0), at(.4, .14), at(.78, .1), at(.78, 0)];
+    extra += path(`M${r1(sh[0].x)},${r1(sh[0].y)}Q${r1(sh[1].x)},${r1(sh[1].y)} ${r1(sh[2].x)},${r1(sh[2].y)}L${r1(sh[3].x)},${r1(sh[3].y)}Z`, shadowFill(.1));
+  }
+  // cuff band near the end
+  if (P.sp.cuff && (P.len > arm.len * 0.55 || P.sp.puff)) {
+    const cc = P.sp.cuff === 'c2' ? sl.c2 : P.sp.cuff === 'rib' ? shadeOf(col, .1) : P.sp.cuff === 'band' ? col : P.sp.cuff;
+    const cuffT = armTube(arm, K, Math.max(0, P.len - 9), P.len, t => P.sw(t) + 0.5, 'flat', 'flat');
+    extra += path(cuffT.d, { fill: cc });
+    if (P.sp.cuff === 'rib') extra += ribLines(cuffT.sp, P.sw, lineOf(cc));
+    if (P.sp.cuff === 'band') extra += ln(cuffT.open.split('M').filter(Boolean).length ? `M${r1(cuffT.sp[0].x + normals(cuffT.sp)[0].x * 30)},${r1(cuffT.sp[0].y + normals(cuffT.sp)[0].y * 30)}L${r1(cuffT.sp[0].x - normals(cuffT.sp)[0].x * 30)},${r1(cuffT.sp[0].y - normals(cuffT.sp)[0].y * 30)}` : '', lineOf(col), 1.6, { opacity: .8 });
+  }
+  if (P.sp.fold) {   // folded hem line just above the sleeve end
+    const fT = armTube(arm, K, Math.max(0, P.len - P.sp.fold), P.len, t => P.sw(t) + 2, 'flat', 'flat');
+    extra += ln(`M${r1(fT.sp[0].x + normals(fT.sp)[0].x * 40)},${r1(fT.sp[0].y + normals(fT.sp)[0].y * 40)}L${r1(fT.sp[0].x - normals(fT.sp)[0].x * 40)},${r1(fT.sp[0].y - normals(fT.sp)[0].y * 40)}`, lc, 1.6, { opacity: .75 });
+  }
+  // long sleeves bunch into creases on the inside of the elbow
+  if (!P.sp.puff && P.len > K.L1 + 14) extra += elbowCrease(arm, K, P, lc);
+  if (P.sp.roll) {   // rolled-up sleeve band
+    const rT = armTube(arm, K, Math.max(0, P.len - 11), P.len, t => P.sw(t) + 1.5, 'flat', 'flat');
+    extra += path(rT.d, { fill: shadeOf(col, .08) }) + ln(rT.open, lc, 1.4, { opacity: .5 });
+  }
+  s = g(s + extra + stripesAlong(ctx, sl, P, arm, K) + rimShade(ctx, d, .12), { 'clip-path': ctx.clipUse(sid) });
+  if (open) s += path(open, { fill: 'none', stroke: lc, 'stroke-width': 2.6, 'stroke-linejoin': 'round' });
+  else s += use(sid, { fill: 'none', stroke: lc, 'stroke-width': 2.6, 'stroke-linejoin': 'round' });
+  return s;
+}
+function elbowCrease(arm, K, P, lc) {
+  const { E } = arm, { u, n, theta } = armBend(arm);
+  const w = Math.min(P.sw(K.L1 / arm.len), bendCap(arm, K, P));
+  // the crook corner: where the two inner edges meet (on a straight arm, simply the inner edge)
+  const dc = Math.min(w / Math.max(Math.sin(theta / 2), .3), w * 2.4);
+  const at = (a, b) => ({ x: r1(E.x + n.x * a + u.x * b), y: r1(E.y + n.y * a + u.y * b) });
+  const sharp = dc > w * 1.3, k1 = sharp ? .42 : .06, k2 = sharp ? .52 : .16;   // a deep crook gets shorter creases
+  const a1 = at(dc + 1, -7), m1 = at(lerp(dc, dc * k1, .55), -3), e1 = at(dc * k1, 0), a2 = at(dc + 1, 5.5), m2 = at(lerp(dc, dc * k2, .55), 3.4), e2 = at(dc * k2, 1.8);
+  return path(`M${a1.x},${a1.y}Q${m1.x},${m1.y} ${e1.x},${e1.y}Q${m2.x},${m2.y} ${a2.x},${a2.y}Z`, shadowFill(.07))
+    + ln(`M${a1.x},${a1.y}Q${m1.x},${m1.y} ${e1.x},${e1.y}M${a2.x},${a2.y}Q${m2.x},${m2.y} ${e2.x},${e2.y}`, lc, 1.2, { opacity: .36 });
+}
+function stripesAlong(ctx, sl, P, arm, K) { return sl.def.sleeveDeco ? sl.def.sleeveDeco(ctx, sl, P, arm, K) : ''; }
+function ribLines(sp, wf, col) {
+  let s = '';
+  const N = normals(sp);
+  for (let i = 0; i < sp.length; i += 1) {
+    const w = wf(i / (sp.length - 1)) + 1;
+    s += `M${r1(sp[i].x + N[i].x * w)},${r1(sp[i].y + N[i].y * w)}L${r1(sp[i].x - N[i].x * w)},${r1(sp[i].y - N[i].y * w)}`;
+  }
+  return ln(s, col, 1, { opacity: .45 });
+}
+function armStripes(ctx, arm, K, F, d, from = 0) {
+  const clip = ctx.clip(d);
+  let s = '';
+  for (const f of [.35, .5, .66, .8]) {
+    const sAt = arm.len * f; if (sAt < from) continue;
+    const p = cutPolyline(arm.pts, sAt), q = p[p.length - 1], q0 = p[p.length - 2];
+    const dx = q.x - q0.x, dy = q.y - q0.y, l = Math.hypot(dx, dy) || 1;
+    const nx = -dy / l, ny = dx / l, w = K.arm + 2;
+    const tip = { x: q.x + nx * w * .1 * arm.side, y: q.y + ny * w * .1 };
+    s += path(`M${r1(q.x + nx * w * arm.side - dx / l * 4)},${r1(q.y + ny * w - dy / l * 4)}L${r1(tip.x)},${r1(tip.y)}L${r1(q.x + nx * w * arm.side + dx / l * 4)},${r1(q.y + ny * w + dy / l * 4)}Z`, { fill: F.acc });
+  }
+  return g(s, { 'clip-path': clip });
+}
+function drawHeld(env, it, arm) {
+  const { K } = env;
+  let at = gripPoint(arm, K);
+  if (it.def.grip === 'front') {
+    const o = gripPoint(K.armL, K), p = gripPoint(K.armR, K);
+    at = { x: (o.x + p.x) / 2, y: (o.y + p.y) / 2 };
+  }
+  return it.def.draw(env, it, at, arm) || '';
+}
+function drawWatch(env, arm) {
+  const { ctx, K, st } = env;
+  const it = itemOf('acc', st.wear.acc);
+  const p = cutPolyline(arm.pts, arm.len - 9);
+  const q = p[p.length - 1], q0 = p[p.length - 2];
+  const ang = Math.atan2(q.y - q0.y, q.x - q0.x) * 180 / Math.PI;
+  const w = K.arm - 1;
+  return g(`<rect x="-6" y="${-w - 1.5}" width="12" height="${2 * w + 3}" rx="3" fill="${it.c2}" stroke="${lineOf(it.c2)}" stroke-width="1.6"/>`
+    + circ(0, 0, 6.6, { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.8 }) + circ(0, 0, 4.6, { fill: '#fffaf0' }) + ln('M0,0L0,-3M0,0L2.4,0', '#3a2a3a', 1.1),
+    { transform: `translate(${r1(q.x)},${r1(q.y)}) rotate(${r1(ang)})` });
+}
+
+/* ---- wear_base.js ---- */
+/* ===== wear_base.js — garment shape helpers + base underlayers ===== */
+/* torso garment (right half points). o: neck ('crew'|'v'|'scoop'|'square'|'turtle'|'wide'|'collar'), hem, ease, sleeveless, flare, vDepth */
+function topRight(K, o = {}) {
+  const e = o.ease ?? 3, hem = o.hem ?? 462, fl = o.flare ?? 0;
+  const pts = [];
+  switch (o.neck || 'crew') {
+    case 'crew': pts.push([CX, 302], [CX + K.neck + 3, 297]); break;
+    case 'v': pts.push([CX, o.vDepth || 340, 1], [CX + K.neck + 5, 296, 1]); break;
+    case 'scoop': pts.push([CX, 320], [CX + K.neck + 10, 301, 1]); break;
+    case 'square': pts.push([CX, 326, 1], [CX + 22, 326, 1], [CX + 24, 304, 1]); break;
+    case 'turtle': pts.push([CX, 296], [CX + K.neck + 4, 292]); break;
+    case 'wide': pts.push([CX, 312], [CX + K.neck + 14, 304, 1]); break;
+    case 'collar': pts.push([CX, 296, 1], [CX + K.neck + 3, 292]); break;
+  }
+  if (o.sleeveless) {
+    const strap = o.strap ?? 10;
+    const sx = Math.min(CX + K.sh - 14, pts[pts.length - 1][0] + strap);
+    pts.push([sx, 302, 1], [CX + K.sh - 7, 306, 1], [CX + K.sh - 10, 330], [CX + K.ch + e - 1, 362]);
+  } else {
+    // shoulder line runs out to the shoulder point; the armhole below it is covered by the set-in sleeve
+    pts.push([CX + K.sh - 12, 303.5], [CX + K.sh + 1, 311], [CX + K.sh - 1, 328], [CX + K.ch + e + 1, 349], [CX + K.ch + e, 370]);
+  }
+  // an untucked top hangs over the trousers, so it is never narrower than the waistband / hips under it;
+  // a tucked top or a dress bodice may follow the waist
+  const fitted = o.fit === 'fitted' || K.tucked;
+  const cover = y => fitted || y < 400 ? 0 : Math.max(torsoHalfAt(K, Math.min(y, 452)), y >= 452 ? K.hi : 0) + 7.5;
+  const at = (y, x) => [CX + Math.max(x, cover(y)), y];
+  if (o.boxy) {
+    pts.push(at(410, K.ch + e + fl * .5), [...at(hem, K.ch + e + fl + 1), 1]);
+    pts.push([CX, hem + 1.5]);
+    return pts;
+  }
+  const waist = fitted ? lerp(K.wa, K.ch, .35) : lerp(K.wa, K.ch, .85);
+  pts.push(at(412, waist + e + fl * .3), at(452, Math.max(K.hi, waist) + e + fl * .7));
+  if (hem > 452) pts.push([...at(hem, Math.max(K.hi, waist) + e + fl + 1), 1]); else pts[pts.length - 1][2] = 1;
+  pts.push([CX, hem + 1.5]);
+  return pts;
+}
+/* bottoms: pants/shorts outline. o: waist(y), hem(y), ease, flare(extra half width at hem), cuff */
+function pantsRight(K, o = {}) {
+  const e = o.ease ?? 3, wY = o.waist ?? 410, hem = o.hem ?? 668, fl = o.flare ?? 0;
+  const pts = [[CX, wY], [CX + K.wa + e, wY, 1], [CX + lerp(K.wa, K.hi, .5) + e, 432], [CX + K.hi + e, 452]];
+  const ys = [490, 530, 570, 610, 650].filter(y => y < hem - 8);
+  const fAt = y => fl * clamp((y - 480) / (hem - 480), 0, 1);
+  for (const y of ys) pts.push([CX + legEdgeAt(K, y).o + e + fAt(y), y]);
+  const eh = legEdgeAt(K, hem);
+  const cy = o.crotch ?? Y.crotch + 6;
+  // the two legs part below the crotch: inner edge never closer to the centre than this V
+  const nIn = o.notch ?? 4;
+  const minIn = y => lerp(1.2, nIn, clamp((y - cy) / Math.max(1, hem - cy), 0, 1));
+  pts.push([CX + eh.o + e + fl, hem, 1], [CX + Math.max(minIn(hem), eh.i - e * .6 - fl * .5), hem + 1, 1]);
+  for (const y of ys.slice().reverse()) if (y > cy + 6) pts.push([CX + Math.max(minIn(y), legEdgeAt(K, y).i - e * .6 - fAt(y) * .5), y]);
+  pts.push([CX + 1.2, cy, 1], [CX, cy]);
+  return pts;
+}
+/* skirt outline. o: waist, hem, ease, flare (hem half width beyond hip) */
+function skirtRight(K, o = {}) {
+  const e = o.ease ?? 3, wY = o.waist ?? 410, hem = o.hem ?? 530, fl = o.flare ?? 20;
+  const hipW = Math.max(K.hi, K.wa) + e;
+  const wW = Math.max(K.wa, torsoHalfAt(K, wY));
+  return [[CX, wY], [CX + wW + e, wY, 1], [CX + lerp(K.wa, hipW, .7) + e * .3, 436], [CX + hipW + fl * .35, 466], [CX + hipW + fl, hem, 1], [CX, hem + 4]];
+}
+/* paint a symmetric garment */
+function garment(env, it, right, o = {}) {
+  const d = S(right);
+  // an untucked top shades the trousers / skirt just under its hem
+  const cast = it.def.slot === 'top' && !env.K.tucked && env.castOnHips ? dropShadow(d, env.castOnHips) : '';
+  return cast + paint(env.ctx, d, o.col || it.c1, { pat: o.noPat ? null : it.patUrl, shade: o.shade, extra: o.extra, sw: o.sw });
+}
+/* shirt collar, as in the reference: a stand (band) round the neck that closes on the top button, and two wings
+   folded over it that lie flat and spread out over the collarbones. Right wing; the left one is its mirror.
+   o.wide: wider spread, o.point: narrow point collar (shows inside a jacket's lapels), o.long: longer points */
+function collarWing(K, o = {}) {
+  const w = K.neck, d = (w - 17) * .6;
+  if (o.point) return [[CX + 2.5, 303, 1], [CX + w + 1.5, 288], [CX + w + 4, 296], [CX + 15.5 + d, o.long ? 328 : 323, 1], [CX + 4.5, 309.5, 1]];
+  const sp = (o.wide ? 36 : 31.5) + d, py = o.long ? 331 : 325;
+  return [[CX + 2.5, 303, 1], [CX + w + 1.5, 288], [CX + sp, 298], [CX + sp, py, 1], [CX + 4.5, 309.5, 1]];
+}
+/* o.pat: fabric pattern, o.buttonDown: little buttons under the points, o.stitch: topstitch colour */
+function shirtCollar(ctx, K, col, o = {}) {
+  const w = K.neck, lc = lineOf(col), R = collarWing(K, o);
+  const band = smooth([[CX - w - 2, 283.5, 1], [CX - w * .45, 292.5], [CX, 297], [CX + w * .45, 292.5], [CX + w + 2, 283.5, 1], [CX + w + 3.5, 291, 1], [CX + w * .5, 300], [CX, 305],
+    [CX - w * .5, 300], [CX - w - 3.5, 291, 1]]);
+  // topstitch: the wing outline pulled in towards its middle
+  const inset = pts => { const mx = pts.reduce((a, p) => a + p[0], 0) / pts.length, my = pts.reduce((a, p) => a + p[1], 0) / pts.length; return smooth(pts.map(([x, y, c]) => [r1(mx + (x - mx) * .84), r1(my + (y - my) * .84), c])); };
+  const tone = o.stitch || lighten(col, .3);
+  let s = paint(ctx, band, shadeOf(col, .05), { pat: o.pat, shade: false, sw: 2.2 }) + circ(CX, 300.5, 2.2, { fill: lighten(col, .5), stroke: lc, 'stroke-width': 1.1 });
+  const L = R.map(([x, y, c]) => [mirX(x), y, c]);
+  for (const pts of [R, L]) {
+    const d = smooth(pts);
+    // the wing lies on the shirt: a thin cast shadow down-right of it (light from the upper left)
+    s += path(d, shadowFill(.14, { transform: 'translate(1.6,2.2)' })) + paint(ctx, d, col, { pat: o.pat, shade: false, sw: 2.3, extra: stitch(inset(pts), tone, .9) });
+  }
+  if (o.buttonDown) for (const p of [R[3], L[3]]) s += circ(r1(lerp(p[0], CX, .13)), p[1] - 4.5, 1.8, { fill: lighten(col, .5), stroke: lc, 'stroke-width': 1 });
+  return s;
+}
+function hoodBack(ctx, K, col) {
+  const d = S([[CX, 262], [CX + 26, 263], [CX + 44, 270], [CX + K.neck + 36, 284], [CX + K.neck + 40, 300], [CX + K.neck + 30, 314], [CX, 316]]);
+  const fold = S([[CX, 280], [CX + K.neck + 10, 280], [CX + K.neck + 24, 288], [CX + K.neck + 26, 300], [CX, 300]]);
+  return paint(ctx, d, col, { shade: false, extra: path(fold, { fill: shadeOf(col, .14) }) + ln(`M${CX + K.neck + 30},286Q${CX + K.neck + 34},296 ${CX + K.neck + 31},306M${CX - K.neck - 30},286Q${CX - K.neck - 34},296 ${CX - K.neck - 31},306`, lineOf(col), 1.3, { opacity: .5 }) });
+}
+/* soft fold shadows on a woven top, as in the reference: crescents running from under the arms down towards the
+   waist, deeper on the right (away from the light); multiplied on like every shadow (pass inside the garment's extra) */
+function sideFolds(K, hem = 466, k = 1) {
+  const one = (s, depth) => {
+    const X = x => r1(CX + s * x), a = K.ch - 1, b = K.ch + 2;
+    return path(`M${X(a)},356Q${X(a - 13)},384 ${X(a - 20)},${416}Q${X(a - 9)},388 ${X(a)},356Z`, shadowFill(depth * k))
+      + path(`M${X(b)},402Q${X(b - 16)},${(402 + hem) / 2 + 4} ${X(b - 30)},${hem - 6}Q${X(b - 12)},${(402 + hem) / 2 - 2} ${X(b)},402Z`, shadowFill(depth * .9 * k));
+  };
+  return one(1, .1) + one(-1, .06);
+}
+function buttons(xs, ys, col, r = 2.6) {
+  let s = '';
+  for (const y of ys) for (const x of xs) s += circ(x, y, r, { fill: col, stroke: lineOf(col), 'stroke-width': 1.2 });
+  return s;
+}
+function pocket(x, y, w, h, col, o = {}) {
+  const lc = lineOf(col);
+  let s = path(`M${x},${y}h${w}v${h - 4}q0,4 -4,4h${-(w - 8)}q-4,0 -4,-4z`, { fill: o.fill || 'none', stroke: lc, 'stroke-width': 1.8, 'stroke-linejoin': 'round' });
+  if (o.pleat) s += ln(`M${x + w / 2 - 3},${y + 6}V${y + h - 1}M${x + w / 2 + 3},${y + 6}V${y + h - 1}`, lc, 1.1, { opacity: .45 });
+  // the flap lies on the pocket: a thin cast shadow under it
+  if (o.flap) s += path(`M${x - 1},${y - 1}h${w + 2}v7q-${(w + 2) / 2},5 -${w + 2},0z`, shadowFill(.14, { transform: 'translate(1,2.2)' }))
+    + path(`M${x - 1},${y - 1}h${w + 2}v7q-${(w + 2) / 2},5 -${w + 2},0z`, { fill: o.flapFill || col, stroke: lc, 'stroke-width': 1.8, 'stroke-linejoin': 'round' })
+    + (o.flapButton ? circ(x + w / 2, y + 6.5, 2.8, { fill: o.flapButton, stroke: lineOf(o.flapButton), 'stroke-width': 1.1 }) : circ(x + w / 2, y + 6, 1.6, { fill: lc }));
+  if (o.stitch) s += stitch(`M${x + 2.5},${y + 2.5}v${h - 6}M${x + w - 2.5},${y + 2.5}v${h - 6}`, o.stitch, 1.1);
+  return s;
+}
+
+/* ---- base layers, used when slots are empty ---- */
+BASE_ITEMS.push(
+  { id: 'basetank', name: '打底背心', c1: '#fdf5e9', tags: [], draw: (env, it) => garment(env, it, topRight(env.K, { neck: 'scoop', sleeveless: true, hem: 458, strap: 9 })) },
+  { id: 'baseshorts', name: '打底短裤', c1: '#cbbfb5', tags: [], draw: (env, it) => garment(env, it, pantsRight(env.K, { hem: 500, ease: 2.5 })) },
+);
+
+/* ---- wear_tops.js ---- */
+/* ===== wear_tops.js — tops ===== */
+function crewRib(K, col, depth = 306) {
+  const w = K.neck + 3;
+  return ln(`M${CX - w},297Q${CX},${depth + 8} ${CX + w},297`, shadeOf(col, .12), 5) + ln(`M${CX - w - 1},299Q${CX},${depth + 12} ${CX + w + 1},299`, lineOf(col), 1.4, { opacity: .6 });
+}
+function ribBand(K, y0, y1, col, half = 120) {
+  let s = path(`M${CX - half},${y0}H${CX + half}V${y1}H${CX - half}Z`, { fill: shadeOf(col, .1) });
+  let d = '';
+  for (let x = CX - half; x <= CX + half; x += 5) d += `M${x},${y0 + 1}V${y1 - 1}`;
+  return s + ln(d, lineOf(col), 1, { opacity: .35 }) + ln(`M${CX - half},${y0}H${CX + half}`, lineOf(col), 1.6, { opacity: .7 });
+}
+function placket(K, y0, y1, col, n = 4, x = CX, o = {}) {
+  const lc = lineOf(col), bc = o.button || lighten(col, .55);
+  let s = ln(`M${x - 4},${y0}V${y1}M${x + 4},${y0}V${y1}`, lc, 1.3, { opacity: .55 });
+  for (let i = 0; i < n; i++) s += circ(x, y0 + 10 + i * (y1 - y0 - 14) / Math.max(1, n - 1), o.r || 2.3, { fill: bc, stroke: o.button ? lineOf(bc) : lc, 'stroke-width': 1.1 });
+  return s;
+}
+
+ITEMS.top.push(
+  { id: 'tee', name: '基础T恤', c1: '#f8f1e6', pat: 'none', pc: '#ff6f91', tags: ['casual', 'street', 'summer', 'sporty'],
+    sleeve: { len: .3, ease: 6.5, flare: 3, fold: 5 },
+    draw: (env, it) => {
+      const { K } = env;
+      const folds = path(`M${CX + 17},363Q${CX - 2},376 ${CX - 27},399Q${CX - 4},385 ${CX + 17},363Z`, shadowFill(.09))
+        + path(`M${CX - 25},424Q${CX + 4},420 ${CX + 31},405Q${CX + 6},428 ${CX - 25},424Z`, shadowFill(.08));
+      return garment(env, it, topRight(K, { neck: 'crew', hem: 446, ease: 5, boxy: true, flare: 2 }), { extra: crewRib(K, it.c1) + folds });
+    } },
+
+  { id: 'ocbd', name: '牛津纺衬衫', c1: '#fbf8f1', pat: 'none', pc: '#a9c8ec', tuck: true, tags: ['preppy', 'classic', 'vintage', 'office'],
+    sleeve: { len: .97, ease: 3.5, cuff: 'band' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1);
+      return garment(env, it, topRight(K, { neck: 'collar', hem: 466 }), {
+        extra: placket(K, 312, 470, it.c1, 5) + pocket(CX + 12, 338, 22, 25, it.c1) + sideFolds(K, 466)
+          + ln(`M${CX - K.sh + 6},372Q${CX - 20},380 ${CX - 8},404M${CX + K.sh - 6},372Q${CX + 20},382 ${CX + 10},408`, lc, 1.3, { opacity: .3 }) })
+        + shirtCollar(ctx, K, it.c1, { buttonDown: true, point: true, pat: it.patUrl });
+    } },
+
+  { id: 'flannel', name: '法兰绒格子衬衫', c1: '#b8322a', pat: 'plaid', pc: '#26222e', tags: ['workwear', 'vintage', 'casual', 'autumn'],
+    sleeve: { len: .96, ease: 4.5, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      return garment(env, it, topRight(K, { neck: 'collar', hem: 476, ease: 4.5 }), {
+        extra: placket(K, 312, 478, it.c1, 5) + pocket(CX - 36, 336, 22, 24, it.c1, { flap: true, flapFill: it.c1 }) + pocket(CX + 14, 336, 22, 24, it.c1, { flap: true, flapFill: it.c1 }) + sideFolds(K, 476) })
+        + shirtCollar(ctx, K, it.c1, { wide: true, pat: it.patUrl });
+    } },
+
+  { id: 'chambray', name: '丹宁工装衬衫', c1: '#7fa3c9', pat: 'none', pc: '#ffffff', tags: ['workwear', 'vintage', 'casual', 'summer'],
+    sleeve: { len: .38, ease: 5.5, roll: true },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const st = '#e2b45c';
+      return garment(env, it, topRight(K, { neck: 'collar', hem: 474, ease: 6 }), {
+        extra: placket(K, 312, 476, it.c1, 5, CX, { button: '#efe6d2', r: 2.9 })
+          + pocket(CX - 41, 336, 28, 30, it.c1, { flap: true, stitch: st, pleat: true, flapButton: '#efe6d2' }) + pocket(CX + 13, 336, 28, 30, it.c1, { flap: true, stitch: st, pleat: true, flapButton: '#efe6d2' })
+          + stitch(`M${CX - K.sh + 4},322Q${CX},334 ${CX + K.sh - 4},322`, st, 1.2) + sideFolds(K, 474) })
+        + shirtCollar(ctx, K, it.c1, { pat: it.patUrl, stitch: st });
+    } },
+
+  { id: 'henley', name: '亨利衫', c1: '#efe5d2', pat: 'none', pc: '#bfae8f', tags: ['workwear', 'casual', 'vintage', 'autumn'],
+    sleeve: { len: .96, ease: 3.5, cuff: 'rib' },
+    draw: (env, it) => garment(env, it, topRight(env.K, { neck: 'crew', hem: 468 }), {
+      extra: crewRib(env.K, it.c1) + placket(env.K, 304, 350, it.c1, 3) + ribBand(env.K, 456, 468, it.c1) }) },
+
+  { id: 'polo', name: '网球Polo衫', c1: '#2f6f4e', c2: '#ffffff', pat: 'none', pc: '#ffffff', tuck: false, tags: ['preppy', 'sporty', 'summer', 'classic'],
+    sleeve: { len: .29, ease: 3.5, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      return garment(env, it, topRight(K, { neck: 'collar', hem: 462 }), {
+        extra: placket(K, 306, 344, it.c1, 2) + path(heartD(CX - 26, 344, 4.2), { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': .8 }) + sideFolds(K, 462, .8) })
+        + shirtCollar(ctx, K, it.c1, {}) + ln(collarEdge(K), it.c2, 1.6, { opacity: .9 });
+    } },
+
+  { id: 'cricket', name: '板球毛衣', c1: '#f4eedf', c2: '#23396b', pat: 'none', pc: '#c9bfa6', tags: ['preppy', 'classic', 'vintage', 'winter'],
+    sleeve: { len: .96, ease: 4.5, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K } = env;
+      const v = 350;
+      const lc = lineOf(it.c1);
+      let cable = '';
+      for (const x of [CX - 30, CX + 30]) { let d = `M${x},${v - 6}`; for (let y = v - 6; y < 470; y += 12) d += `q6,6 0,12`; cable += ln(d, lc, 1.6, { opacity: .45 }) + ln(d.replace(/q6,6/g, 'q-6,6'), lc, 1.6, { opacity: .45 }); }
+      for (const x of [CX - 12, CX + 12, CX - 48, CX + 48]) cable += ln(`M${x},${v - 10}V470`, lc, 1, { opacity: .3 });
+      const vBand = (off, c, w) => ln(`M${CX - K.neck - 5 - off},${297 + off * .3}L${CX},${v + off}L${CX + K.neck + 5 + off},${297 + off * .3}`, c, w);
+      return garment(env, it, topRight(K, { neck: 'v', vDepth: v, hem: 470, ease: 4.5 }), {
+        extra: cable + ribBand(K, 456, 470, it.c1) + ln(`M${CX - 120},460H${CX + 120}`, it.c2, 2.6) + ln(`M${CX - 120},465H${CX + 120}`, '#a23b4a', 2.2) })
+        + vBand(3, shadeOf(it.c1, .06), 7) + vBand(1.5, it.c2, 2.4) + vBand(5.2, '#a23b4a', 2);
+    },
+    sleeveDeco: (ctx, sl, P, arm, K) => '' },
+
+  { id: 'turtle', name: '高领毛衣', c1: '#2e2b36', pat: 'none', pc: '#55505f', tags: ['classic', 'cool', 'winter', 'elegant'],
+    sleeve: { len: .96, ease: 4, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K } = env;
+      const w = K.neck + 5;
+      let rib = '';
+      for (let x = CX - 60; x <= CX + 60; x += 7) rib += `M${x},300V462`;
+      const lc = lineOf(it.c1);
+      return garment(env, it, topRight(K, { neck: 'turtle', hem: 466, ease: 4 }), { extra: ln(rib, lc, 1.2, { opacity: .35 }) + ribBand(K, 454, 466, it.c1) })
+        + flat(`M${CX - w},270Q${CX},276 ${CX + w},270L${CX + w + 2},300Q${CX},310 ${CX - w - 2},300Z`, shadeOf(it.c1, .05), lc, 2.6)
+        + ln(`M${CX - w + 4},274V300M${CX - w + 11},275V303M${CX - 3},276V305M${CX + 4},276V305M${CX + w - 11},275V303M${CX + w - 4},274V300`, lc, 1.1, { opacity: .45 });
+    } },
+
+  { id: 'hoodie', name: '连帽卫衣', c1: '#f4a6c0', c2: '#fff4f8', pat: 'none', pc: '#ffffff', tags: ['street', 'casual', 'sporty', 'cute'],
+    sleeve: { len: .96, ease: 5.5, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1);
+      const hood = hoodBack(ctx, K, shadeOf(it.c1, .06));
+      const rimD = `M${CX - K.neck - 14},292C${CX - 34},318 ${CX - 12},330 ${CX},334C${CX + 12},330 ${CX + 34},318 ${CX + K.neck + 14},292C${CX + 22},308 ${CX + 10},314 ${CX},316C${CX - 10},314 ${CX - 22},308 ${CX - K.neck - 14},292Z`;
+      const rim = path(rimD, shadowFill(.14, { transform: 'translate(1.2,2.4)' })) + flat(rimD, it.c1, lc, 2.4);
+      const strings = ln(`M${CX - 8},322L${CX - 10},372M${CX + 8},322L${CX + 11},366`, it.c2, 2.6) + circ(CX - 10, 374, 2.6, { fill: lc }) + circ(CX + 11, 368, 2.6, { fill: lc });
+      const pocketD = `M${CX - 40},${474 - 62}L${CX + 40},${474 - 62}L${CX + 50},${474 - 14}L${CX - 50},${474 - 14}Z`;
+      return {
+        hood,
+        main: garment(env, it, topRight(K, { neck: 'crew', hem: 478, ease: 5.5 }), {
+          extra: ribBand(K, 464, 478, it.c1) + path(pocketD, { fill: 'none', stroke: lc, 'stroke-width': 1.8, 'stroke-linejoin': 'round' }) + ln(`M${CX - 44},${474 - 40}Q${CX - 40},${474 - 30} ${CX - 47},${474 - 18}M${CX + 44},${474 - 40}Q${CX + 40},${474 - 30} ${CX + 47},${474 - 18}`, lc, 1.4, { opacity: .5 }) })
+          + rim + strings,
+      };
+    } },
+
+  { id: 'sailor', name: '水手服', c1: '#ffffff', c2: '#22345e', pat: 'none', pc: '#9fb7e8', tags: ['cute', 'preppy', 'summer', 'sweet'],
+    sleeve: { len: .3, ease: 4, cuff: 'c2' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      return garment(env, it, topRight(K, { neck: 'v', vDepth: 356, hem: 460, ease: 4 }), { extra: sideFolds(K, 460, .7) }) + sailorCollar(K, it.c2);
+    } },
+  { id: 'blouse', name: '泡泡袖衬衫', c1: '#fbf8f2', c2: '#c8303f', pat: 'none', pc: '#ffd1dc', tuck: true, tags: ['sweet', 'cute', 'elegant', 'vintage'],
+    sleeve: { len: .27, ease: 3, puff: true, cuff: 'band' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1);
+      const pp = (s) => { const X = x => CX + s * x, d = `M${X(1)},299C${X(14)},292 ${X(K.neck + 14)},289 ${X(K.neck + 21)},300C${X(K.neck + 24)},316 ${X(20)},327 ${X(2)},318Z`;
+        return path(d, shadowFill(.12, { transform: 'translate(1.5,2)' })) + flat(d, it.c1, lc, 2.2) + stitch(`M${X(6)},301C${X(15)},296 ${X(K.neck + 12)},294 ${X(K.neck + 17)},302C${X(K.neck + 19)},313 ${X(19)},321 ${X(6)},315`, lighten(lc, .5), .8, { opacity: .5 }); };
+      const bc = it.c2, blc = lineOf(bc);
+      const tails = flat(smooth([[CX - 3, 316], [CX - 13, 328], [CX - 20, 338, 1], [CX - 12, 337], [CX - 7, 342, 1], [CX - 1, 324], [CX + 1, 324], [CX + 7, 342, 1], [CX + 12, 337], [CX + 20, 338, 1], [CX + 13, 328], [CX + 3, 316]]), shadeOf(bc, .08), blc, 2.2);
+      const loops = flat(smooth([[CX - 3, 312], [CX - 19, 300], [CX - 27, 304], [CX - 26, 320], [CX - 18, 326], [CX - 3, 318], [CX + 3, 318], [CX + 18, 326], [CX + 26, 320], [CX + 27, 304], [CX + 19, 300], [CX + 3, 312]]), bc, blc, 2.3)
+        + ln(`M${CX - 7},313Q${CX - 15},310 ${CX - 20},315M${CX + 7},313Q${CX + 15},310 ${CX + 20},315`, blc, 1.4, { opacity: .6 });
+      const bow = g(tails + loops + flat(`M${CX - 5},308L${CX + 5},308L${CX + 6},322L${CX - 6},322Z`, shadeOf(bc, .06), blc, 2.1), { transform: `translate(${CX},318) scale(1.22) translate(${-CX},-312)` });
+      return garment(env, it, topRight(K, { neck: 'crew', hem: 466, ease: 3.5 }), { extra: placket(K, 322, 470, it.c1, 4) + sideFolds(K, 466, .8) }) + pp(-1) + pp(1) + bow;
+    } },
+
+  { id: 'cami', name: '吊带背心', c1: '#ffd3e2', pat: 'none', pc: '#ffffff', tags: ['summer', 'sweet', 'elegant', 'party'],
+    draw: (env, it) => {
+      const { K } = env;
+      const lc = lineOf(it.c1);
+      let lace = '';
+      for (let x = CX - K.ch + 4; x < CX + K.ch - 4; x += 8) lace += `M${x},${336}a4,4 0 0,0 8,0`;
+      return garment(env, it, topRight(K, { neck: 'square', sleeveless: true, hem: 456, strap: 3 }), { extra: ln(lace, '#fff', 2.2, { opacity: .9 }) })
+        + ln(`M${CX + 23},306L${CX + 30},318M${CX - 23},306L${CX - 30},318`, lc, .1);
+    } },
+
+  { id: 'raglan', name: '棒球T恤', c1: '#fdfbf6', c2: '#23396b', pat: 'none', pc: '#ffffff', tags: ['sporty', 'casual', 'street', 'vintage'],
+    noSeam: true, sleeve: { len: .62, ease: 3.5, color: 'c2', cuff: 'rib' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const c2 = it.c2;
+      // raglan panels: everything above the diagonal seam from the neck to the armpit (clipped to the body by garment())
+      const rag = s => { const X = x => CX + s * x; return path(`M${X(K.neck + 3)},290L${X(K.sh + 30)},290L${X(K.sh + 30)},349L${X(K.ch + 4)},349Z`, { fill: c2 })
+        + ln(`M${X(K.neck + 3)},297L${X(K.ch + 4)},349`, lineOf(c2), 2.2); };
+      return garment(env, it, topRight(K, { neck: 'crew', hem: 466 }), { extra: rag(-1) + rag(1) + crewRib(K, c2) });
+    } },
+  { id: 'aloha', name: '夏威夷衬衫', c1: '#2f8f8a', pat: 'flower', pc: '#fff1c2', tags: ['summer', 'casual', 'vintage', 'street'],
+    sleeve: { len: .3, ease: 6.5, flare: 2, fold: 4 },
+    draw: (env, it) => {
+      const { K } = env;
+      const lc = lineOf(it.c1);
+      // camp collar: open at the neck, the two wings fold back and lie flat on the chest
+      const wing = s => { const X = x => r1(CX + s * x);
+        return smooth([[X(1), 344, 1], [X(K.neck + 1), 289, 1], [X(K.neck + 12), 291], [X(K.neck + 24), 299, 1], [X(22), 334], [X(8), 346, 1]]); };
+      const collar = [1, -1].map(s => path(wing(s), shadowFill(.14, { transform: 'translate(1.4,2.4)' })) + flat(wing(s), it.c1, lc, 2.3)
+        + (it.patUrl ? path(wing(s), { fill: it.patUrl }) : '') + path(wing(s), { fill: 'none', stroke: lc, 'stroke-width': 2.3, 'stroke-linejoin': 'round' })).join('');
+      return garment(env, it, topRight(K, { neck: 'v', vDepth: 348, hem: 464, ease: 6.5, boxy: true, flare: 3 }), {
+        extra: placket(K, 346, 466, it.c1, 3, CX, { button: '#f4ead0', r: 2.6 }) + sideFolds(K, 464, .8) }) + collar;
+    } },
+
+  { id: 'breton', name: '法式海魂衫', c1: '#fbf8f1', pat: 'stripe', pc: '#23396b', tags: ['classic', 'casual', 'vintage', 'summer'],
+    sleeve: { len: .88, ease: 3.5 },
+    draw: (env, it) => {
+      const { K } = env;
+      const lc = lineOf(it.c1), w = K.neck + 14;
+      // boat neck: the stripes stop under a plain facing band
+      const band = path(`M${CX - w - 2},302Q${CX},322 ${CX + w + 2},302L${CX + w + 2},311Q${CX},331 ${CX - w - 2},311Z`, { fill: it.c1 })
+        + ln(`M${CX - w - 2},311Q${CX},331 ${CX + w + 2},311`, lc, 1.3, { opacity: .55 });
+      return garment(env, it, topRight(K, { neck: 'wide', hem: 464, ease: 4 }), { extra: band + sideFolds(K, 464, .7) });
+    } },
+
+  { id: 'fisherman', name: '渔夫麻花毛衣', c1: '#eee4cf', pat: 'none', pc: '#c9bfa6', tags: ['winter', 'vintage', 'classic', 'workwear'],
+    sleeve: { len: .96, ease: 6, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K } = env;
+      const lc = lineOf(it.c1), top = 318, bot = 458;
+      // aran knit: a diamond lattice down the middle, rope cables either side, moss stitch in between
+      let lattice = '';
+      for (let y = top; y < bot; y += 16) lattice += `M${CX},${y}L${CX + 11},${y + 8}L${CX},${y + 16}L${CX - 11},${y + 8}Z`;
+      let rope = '';
+      for (const x of [CX - 27, CX + 27, CX - 50, CX + 50]) { let d = `M${x - 4},${top}`; for (let y = top; y < bot; y += 10) d += `q8,5 0,10`; rope += ln(d, lc, 1.5, { opacity: .5 }) + ln(d.replace(/M(\d+(\.\d+)?)/, (m, v) => 'M' + (+v + 8)).replace(/q8,5/g, 'q-8,5'), lc, 1.5, { opacity: .5 }); }
+      let moss = '';
+      const r = rng(5);
+      for (let i = 0; i < 70; i++) { const s = r() < .5 ? -1 : 1, x = CX + s * (14 + r() * 8), y = top + r() * (bot - top); moss += `M${r1(x)},${r1(y)}h1.6`; }
+      return garment(env, it, topRight(K, { neck: 'crew', hem: 472, ease: 6 }), {
+        extra: path(lattice, { fill: 'none', stroke: lc, 'stroke-width': 1.5, opacity: .45 }) + rope + ln(moss, lc, 1.4, { opacity: .4 })
+          + ln(`M${CX - 39},${top}V${bot}M${CX + 39},${top}V${bot}`, lc, 1, { opacity: .3 }) + ribBand(K, 458, 472, it.c1) + crewRib(K, it.c1, 310) });
+    } },
+
+  { id: 'sweat', name: '学院圆领卫衣', c1: '#b9bdc6', c2: '#23396b', pat: 'none', pc: '#ffffff', tags: ['preppy', 'sporty', 'casual', 'vintage'],
+    sleeve: { len: .96, ease: 5.5, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K } = env;
+      const lc = lineOf(it.c1);
+      // the V-shaped rib insert under the neckband, a classic of old gym sweatshirts
+      const gusset = path(`M${CX - 8},302L${CX},318L${CX + 8},302Z`, { fill: shadeOf(it.c1, .1), stroke: lc, 'stroke-width': 1.4, 'stroke-linejoin': 'round' })
+        + ln(`M${CX - 4},304L${CX},312M${CX + 4},304L${CX},312`, lc, 1, { opacity: .45 });
+      const arc = ln(`M${CX - 30},350Q${CX},338 ${CX + 30},350`, it.c2, 5) + ln(`M${CX - 30},350Q${CX},338 ${CX + 30},350`, lighten(it.c2, .55), 1.2, { 'stroke-dasharray': '4 4' });
+      return garment(env, it, topRight(K, { neck: 'crew', hem: 474, ease: 5.5, boxy: true, flare: 1 }), {
+        extra: crewRib(K, it.c1, 308) + gusset + arc + ribBand(K, 460, 474, it.c1) + sideFolds(K, 474, .7) });
+    } },
+);
+/* sailor collar (square back flap seen from the front as two navy wings with white tape) and the red scarf knot */
+function sailorCollar(K, c2) {
+  const l2 = lineOf(c2);
+  const collar = S([[CX, 352, 1], [CX + 14, 330], [CX + K.neck + 6, 296, 1], [CX + K.sh - 4, 312], [CX + K.sh + 6, 332, 1], [CX + 30, 348], [CX + 6, 362, 1], [CX, 364, 1]]);
+  const stripesL = ln(`M${CX + K.neck + 9},302L${CX + K.sh + 1},330M${CX - K.neck - 9},302L${CX - K.sh - 1},330`, '#fff', 2) + ln(`M${CX + K.sh - 2},336L${CX + 10},356M${CX - K.sh + 2},336L${CX - 10},356`, '#fff', 2);
+  const scarf = flat(smooth([[CX - 4, 350], [CX - 20, 344], [CX - 24, 358, 1], [CX - 8, 358], [CX - 16, 388, 1], [CX, 368], [CX + 16, 388, 1], [CX + 8, 358], [CX + 24, 358, 1], [CX + 20, 344], [CX + 4, 350]]), '#e8485f', lineOf('#e8485f'), 2.2) + circ(CX, 354, 5, { fill: '#e8485f', stroke: lineOf('#e8485f'), 'stroke-width': 2 });
+  return path(collar, shadowFill(.14, { transform: 'translate(1.4,2.4)' })) + flat(collar, c2, l2, 2.4) + stripesL + scarf;
+}
+/* tipping stripe along the outer edge of each collar wing (polo) */
+function collarEdge(K) {
+  const R = collarWing(K), a = R[2], b = R[3];
+  const one = s => { const X = x => CX + s * (x - CX); return `M${r1(X(a[0] - 2.5))},${r1(a[1] + 2.6)}L${r1(X(b[0] - 3.8))},${r1(b[1] - 2.4)}`; };
+  return one(1) + one(-1);
+}
+
+/* ---- wear_bottoms.js ---- */
+/* ===== wear_bottoms.js — bottoms & one-pieces ===== */
+function waistband(K, col, o = {}) {
+  const e = o.ease ?? 3, y = o.y ?? 410, h = o.h ?? 12;
+  const w = Math.max(K.wa, torsoHalfAt(K, y + h * .5)) + e;
+  const band = `M${CX - w},${y}L${CX + w},${y}L${CX + w + .8},${y + h}L${CX - w - .8},${y + h}Z`;
+  let s = (o.cast === false ? '' : path(band, shadowFill(.12, { transform: 'translate(.8,2.4)' }))) + flat(band, shadeOf(col, .06), lineOf(col), 2.2);
+  if (o.loops) for (const x of [-w + 8, -20, 20, w - 8]) s += path(`M${CX + x - 2},${y - 1}h4v${h + 3}h-4z`, { fill: shadeOf(col, .1), stroke: lineOf(col), 'stroke-width': 1 });
+  if (o.button) s += circ(CX, y + h / 2, 3, { fill: o.button, stroke: lineOf(o.button), 'stroke-width': 1.2 });
+  return s;
+}
+function pantsDetails(K, it, o = {}) {
+  const lc = lineOf(it.c1), e = o.ease ?? 3;
+  let s = '';
+  if (o.fly !== false) s += ln(`M${CX + 7},${424}V${470}Q${CX + 6},${480} ${CX},${484}`, lc, 1.5, { opacity: .6 });
+  if (o.pockets !== false) {
+    // the pocket mouth: a slim shadow just inside the curve, then the curve itself
+    for (const s2 of [-1, 1]) { const X = d => r1(CX + s2 * d);
+      s += path(`M${X(K.wa - 5)},423Q${X(K.wa + 2)},440 ${X(K.hi + e - 1)},452L${X(K.hi + e - 1)},446Q${X(K.wa + 4)},436 ${X(K.wa - 1)},423Z`, shadowFill(.1)); }
+    s += ln(`M${CX - K.wa + 5},423Q${CX - K.wa - 2},440 ${CX - K.hi - e + 1},452M${CX + K.wa - 5},423Q${CX + K.wa + 2},440 ${CX + K.hi + e - 1},452`, lc, 1.6, { opacity: .7 });
+  }
+  // V folds pulling out from the crotch, as in the reference
+  if (o.crotch !== false) { const cy = o.crotchY ?? Y.crotch + 6;
+    s += path(`M${CX - 2},${cy - 4}Q${CX - 12},${cy - 18} ${CX - 26},${cy - 26}Q${CX - 12},${cy - 14} ${CX - 3},${cy + 2}Z`, shadowFill(.06))
+      + path(`M${CX + 2},${cy - 4}Q${CX + 14},${cy - 16} ${CX + 30},${cy - 22}Q${CX + 14},${cy - 10} ${CX + 3},${cy + 2}Z`, shadowFill(.1)); }
+  if (o.crease) for (const s2 of [-1, 1]) { const a = legEdgeAt(K, 470), b = legEdgeAt(K, o.hem - 4); s += ln(`M${CX + s2 * (a.o + a.i) / 2},470L${CX + s2 * ((b.o + b.i) / 2)},${o.hem - 4}`, lc, 1.3, { opacity: .45 }); }
+  // soft folds where the cloth bends over the knee (clipped away on shorts)
+  if (o.knee !== false) for (const s2 of [-1, 1]) {
+    const a = legEdgeAt(K, 582), X = d => r1(CX + s2 * d), m = (a.o + a.i) / 2;
+    s += path(`M${X(a.i - e * .5 + 1)},572Q${X(m - 3)},575 ${X(m + 3)},581Q${X(m - 4)},579 ${X(a.i - e * .5 + 1)},576Z`, shadowFill(s2 > 0 ? .08 : .05))
+      + ln(`M${X(a.i - e * .5 + 1)},572Q${X(m - 3)},575 ${X(m + 3)},581M${X(a.o + e - 1)},590Q${X(m + 6)},587 ${X(m + 1)},585`, lc, 1.2, { opacity: .32 });
+  }
+  if (o.stitch) s += stitch(`M${CX + 11},424V468Q${CX + 10},482 ${CX + 2},486`, o.stitch, 1.2) + stitch(`M${CX - K.wa - e + 3},460L${CX - K.wa - e + 3},470M${CX + K.wa + e - 3},460L${CX + K.wa + e - 3},470`, o.stitch, 1.2);
+  return s;
+}
+/* band across one pant leg between y0..y1 (for cuffs) */
+function pantCuff(K, y0, y1, e, fl, hem, s, col, o = {}) {
+  const fAt = y => fl * clamp((y - 480) / (hem - 480), 0, 1);
+  const X = d => CX + s * d;
+  const a = legEdgeAt(K, y0), b = legEdgeAt(K, y1);
+  const pts = [[X(a.o + e + fAt(y0) + 1.5), y0, 1], [X(b.o + e + fAt(y1) + 1.5), y1, 1], [X(b.i - e * .6 - fAt(y1) * .5 - 1.5), y1, 1], [X(a.i - e * .6 - fAt(y0) * .5 - 1.5), y0, 1]];
+  const fold = [[X(a.o + e + fAt(y0) + 1.5), y0], [X(a.i - e * .6 - fAt(y0) * .5 - 1.5), y0], [X(a.i - e * .6 - fAt(y0) * .5 - 1.5), y0 + 3.5], [X(a.o + e + fAt(y0) + 1.5), y0 + 3.5]];
+  return path(poly(pts) + 'Z', shadowFill(.12, { transform: 'translate(.6,2.2)' })) + flat(poly(pts) + 'Z', col, lineOf(col), 2.2)
+    + path(poly(fold) + 'Z', shadowFill(.08)) + (o.inner || '');
+}
+/* soft folds on a flared skirt: a fold line from each x0 at the waist out to the hem, with its shadow beside it */
+function skirtFolds(K, y0, hem, xs, spread, lc) {
+  let s = '';
+  for (const x of xs) { const s2 = Math.sign(x), x1 = x + s2 * spread * .4, x2 = x + s2 * spread * .75;
+    s += path(`M${CX + x},${y0}Q${CX + x1},${(y0 + hem) / 2} ${CX + x2},${hem}L${CX + x2 + 9},${hem}Q${CX + x1 + 4},${(y0 + hem) / 2} ${CX + x + 1},${y0}Z`, shadowFill(s2 > 0 ? .08 : .05))
+      + ln(`M${CX + x},${y0}Q${CX + x1},${(y0 + hem) / 2} ${CX + x2},${hem}`, lc, 1.4, { opacity: .4 }); }
+  return s;
+}
+/* knife-pleated skirt: pleat lines fanning out from the waistband, every other pleat in shadow, zigzag hem */
+function pleatSkirt(ctx, K, col, patUrl, o) {
+  const { hem, fl, wY } = o;
+  let folds = '', shade = '';
+  const hx = Math.max(K.hi, K.wa) + 3 + fl, tw = Math.max(K.wa, torsoHalfAt(K, wY)) + 3, fy = wY + 13;
+  for (let i = 1; i < 10; i++) {
+    const t = i / 10, x0 = lerp(CX - tw, CX + tw, t), x1 = lerp(CX - hx, CX + hx, t);
+    folds += `M${r1(x0)},${fy}L${r1(x1)},${hem + (i % 2 ? 5 : 0)}`;
+    if (i % 2) shade += `M${r1(x0)},${fy}L${r1(x1)},${hem + 6}L${r1(lerp(CX - hx, CX + hx, t + .1))},${hem + 6}L${r1(lerp(CX - tw, CX + tw, t + .1))},${fy}Z`;
+  }
+  return paint(ctx, skirtPath(K, { hem, flare: fl, zig: 10, waist: wY }), col, { pat: patUrl, shade: 'skirt', extra: path(shade, shadowFill(.07)) + ln(folds, lineOf(col), 1.4, { opacity: .38 }) });
+}
+/* skirt with optional zigzag pleated hem */
+function skirtPath(K, o) {
+  const R = skirtRight(K, o);
+  if (!o.zig) return S(R);
+  const right = R.slice(0, -1);
+  const hx = right[right.length - 1][0], hem = o.hem;
+  const pts = [...right];
+  const n = o.zig;
+  for (let i = 1; i < n; i++) { const x = lerp(hx, mirX(hx), i / n); pts.push([x, hem + (i % 2 ? 5 : 0), 1]); }
+  pts.push([mirX(hx), hem, 1], ...mirAll(right.slice(0, -1).reverse()));
+  return smooth(pts);
+}
+
+ITEMS.bottom.push(
+  { id: 'pleated', name: '百褶短裙', c1: '#b9233b', pat: 'tartan', pc: '#20294f', tags: ['preppy', 'cute', 'sweet'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const wY = 398;
+      const band = it.pc && it.pat !== 'none' ? it.pc : shadeOf(it.c1, .12);
+      return pleatSkirt(ctx, K, it.c1, it.patUrl, { hem: 530, fl: 30, wY }) + waistband(K, band, { h: 13, y: wY });
+    } },
+  { id: 'aline', name: 'A字半身裙', c1: '#c9a27c', pat: 'none', pc: '#ffffff', tags: ['elegant', 'vintage', 'office', 'classic'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1);
+      return paint(ctx, skirtPath(K, { hem: 572, flare: 30 }), it.c1, { pat: it.patUrl, shade: 'skirt', extra: skirtFolds(K, 424, 572, [-18, 18], 30, lc) })
+        + waistband(K, it.c1, { button: lighten(it.c1, .5) }) + buttons([CX], [440, 462, 484], lighten(it.c1, .5), 2.4);
+    } },
+  { id: 'tutu', name: '蓬蓬纱裙', c1: '#ffc2dc', pat: 'none', pc: '#ffffff', tags: ['cute', 'fantasy', 'sweet', 'party'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      let s = '';
+      const layer = (hem, fl, col, op, seed) => {
+        const R = skirtRight(K, { hem, flare: fl, ease: 3 });
+        const hx = R[R.length - 2][0];
+        const pts = R.slice(0, -1);
+        for (let i = 1; i < 12; i++) { const x = lerp(hx, mirX(hx), i / 12); pts.push([x, hem + (i % 2 ? 7 : -1), i % 2 === 0]); }
+        pts.push([mirX(hx), hem, 1], ...mirAll(R.slice(1, -2).reverse()));
+        return path(smooth(pts), { fill: col, opacity: op, stroke: lineOf(col), 'stroke-width': 2, 'stroke-linejoin': 'round' });
+      };
+      s += layer(524, 54, lighten(it.c1, .2), .95) + layer(512, 46, it.c1, .9) + layer(498, 36, lighten(it.c1, .35), .85);
+      const r = rng(7); let sp = '';
+      for (let i = 0; i < 16; i++) sp += circ(CX - 70 + r() * 140, 440 + r() * 76, .9 + r() * 1.3, { fill: '#fff', opacity: .9 });
+      return s + sp + waistband(K, darken(it.c1, .05), { h: 10 });
+    } },
+  { id: 'denimshorts', name: '牛仔短裤', c1: '#77a1d6', pat: 'none', pc: '#ffffff', tags: ['casual', 'summer', 'street'],
+    draw: (env, it) => {
+      const { K } = env;
+      const hem = 507, e = 6, wY = 426, cuffH = 15;
+      const lc = lineOf(it.c1), cuffC = lighten(it.c1, .22);
+      const body = garment(env, it, pantsRight(K, { waist: wY, hem, ease: e, flare: 5, notch: 7, crotch: 488 }),
+        { extra: pantsDetails(K, it, { ease: e, fly: false, pockets: false })
+          + ln(`M${CX - K.wa + 4},${wY + 12}Q${CX - K.wa - 3},${wY + 30} ${CX - K.hi - e + 1},${wY + 36}M${CX + K.wa - 4},${wY + 12}Q${CX + K.wa + 3},${wY + 30} ${CX + K.hi + e - 1},${wY + 36}`, lc, 1.8)
+          + ln(`M${CX + 8},${wY + 12}V${wY + 44}Q${CX + 8},${wY + 54} ${CX + 1},${wY + 58}`, lc, 1.6, { opacity: .7 })
+          + stitch(`M${CX + 12},${wY + 13}V${wY + 44}Q${CX + 12},${wY + 58} ${CX + 2},${wY + 62}`, '#e8c26a', 1.1)
+          + path(`M${CX + K.wa - 14},${wY + 16}h9v8h-9z`, { fill: 'none', stroke: lc, 'stroke-width': 1.3, opacity: .6 })
+          + path(`M${CX - K.hi - 20},${hem - 30}L${CX - 8},${hem - 42}L${CX - 4},${hem - 30}Z`, shadowFill(.08)) });
+      let cuffs = '';
+      for (const s2 of [-1, 1]) cuffs += pantCuff(K, hem - cuffH, hem + 1, e + 1.5, 5, hem, s2, cuffC, { inner: '' }) + ln(`M${CX + s2 * (legEdgeAt(K, hem - 7).i + 1)},${hem - 7}L${CX + s2 * (legEdgeAt(K, hem - 7).o + e + 6)},${hem - 7}`, lineOf(cuffC), 1.3, { opacity: .55 });
+      return body + cuffs + waistband(K, it.c1, { y: wY, ease: e, loops: true, button: '#d9b45c' });
+    } },
+  { id: 'chinos', name: '卡其裤', c1: '#d2bb8e', pat: 'none', pc: '#ffffff', tags: ['preppy', 'classic', 'casual', 'office'],
+    draw: (env, it) => {
+      const { K } = env;
+      const hem = 628, e = 6, fl = 5, cuffH = 18;
+      const cuffC = darken(it.c1, .04);   // turn-ups are the same cloth, only a touch darker
+      let cuffs = '';
+      for (const s2 of [-1, 1]) {
+        cuffs += pantCuff(K, hem - cuffH, hem + 1, e + 1.2, fl, hem, s2, cuffC);
+        const a = legEdgeAt(K, hem - 9);
+        cuffs += ln(`M${CX + s2 * (a.i - e * .6 - fl * .5 - 1)},${hem - 9}L${CX + s2 * (a.o + e + fl + 2)},${hem - 9}`, lineOf(cuffC), 1.2, { opacity: .45 });
+      }
+      return garment(env, it, pantsRight(K, { hem, ease: e, flare: fl, notch: 7 }), { extra: pantsDetails(K, it, { ease: e, crease: true, hem }) })
+        + cuffs + waistband(K, it.c1, { ease: e, loops: true, button: '#5a4632' });
+    } },
+  { id: 'jeans', name: '复古赤耳牛仔裤', c1: '#2f4a7a', pat: 'none', pc: '#ffffff', tags: ['workwear', 'vintage', 'casual', 'street'],
+    draw: (env, it) => {
+      const { K } = env;
+      const hem = 632, e = 6, fl = 5, st = '#e2a94a', cuffH = 18;
+      let cuffs = '';
+      for (const s2 of [-1, 1]) {
+        cuffs += pantCuff(K, hem - cuffH, hem + 1, e + 1.2, fl, hem, s2, lighten(it.c1, .2));
+        const a = legEdgeAt(K, hem - cuffH);
+        const xo = CX + s2 * (a.o + e + fl + 1.5), xi = CX + s2 * (a.i - e * .6 - fl * .5 - 1);
+        cuffs += ln(`M${xo},${hem - cuffH + 1}L${xo + s2 * .5},${hem}`, '#f6f2ea', 3.2) + ln(`M${xo - s2 * 1.8},${hem - cuffH + 1}L${xo - s2 * 1.3},${hem}`, '#d63b45', 1.2);
+        cuffs += stitch(`M${xo - s2 * 3},${hem - 5}L${xi},${hem - 5}`, st, 1);
+      }
+      return garment(env, it, pantsRight(K, { hem, ease: e, flare: fl, notch: 7 }), { extra: pantsDetails(K, it, { ease: e, stitch: st }) + pocket(CX + K.wa - 20, 426, 11, 11, it.c1) + circ(CX - K.wa + 4, 426, 1.6, { fill: '#c98f3a' }) + circ(CX + K.wa - 4, 426, 1.6, { fill: '#c98f3a' }) })
+        + cuffs + waistband(K, it.c1, { ease: e, loops: true, button: '#c98f3a' }) + stitch(`M${CX - K.wa - e},417H${CX + K.wa + e}`, st, 1.1);
+    } },
+  { id: 'overalls', name: '背带工装裤', c1: '#2c3b5e', pat: 'pin', pc: '#eeebe2', forceTuck: true, tags: ['workwear', 'vintage', 'casual', 'cute'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const hem = 652, e = 6;
+      const lc = lineOf(it.c1);
+      const bibW = Math.min(K.ch - 8, 34);
+      const bib = paint(ctx, `M${CX - bibW},344L${CX + bibW},344L${CX + bibW + 2},416L${CX - bibW - 2},416Z`, it.c1, { pat: it.patUrl })
+        + pocket(CX - 13, 356, 26, 24, it.c1, { stitch: '#e2b45c' });
+      const strap = s2 => { const X = d => CX + s2 * d; return paint(ctx, `M${X(bibW - 10)},346L${X(bibW)},346L${X(K.sh - 10)},306L${X(K.sh - 21)},303Z`, it.c1, { pat: it.patUrl, shade: false, sw: 2.2 }) + circ(X(bibW - 5), 350, 4.5, { fill: '#d9c37a', stroke: '#8a7230', 'stroke-width': 1.6 }) + circ(X(bibW - 5), 350, 1.6, { fill: '#8a7230' }); };
+      let cuffs = '';
+      for (const s2 of [-1, 1]) cuffs += pantCuff(K, hem - 12, hem, e, 3, hem, s2, it.c1, { inner: '' });
+      return {
+        main: garment(env, it, pantsRight(K, { hem, ease: e, flare: 3, waist: 404 }), { extra: pantsDetails(K, it, { ease: e, pockets: true }) + ln(`M${CX - K.wa - e},404L${CX + K.wa + e},404`, lc, 2) }) + cuffs,
+        bib: bib + strap(-1) + strap(1) + buttons([CX - K.wa - e + 4, CX + K.wa + e - 4], [414], '#d9c37a', 3),
+      };
+    } },
+  { id: 'trousers', name: '西装裤', c1: '#565b6b', pat: 'none', pc: '#8a8fa0', tags: ['classic', 'office', 'elegant', 'vintage'],
+    draw: (env, it) => {
+      const { K } = env;
+      const hem = 672, e = 4;
+      const lc = lineOf(it.c1);
+      return garment(env, it, pantsRight(K, { hem, ease: e, flare: 2 }), { extra: pantsDetails(K, it, { ease: e, crease: true, hem }) + ln(`M${CX - 16},423L${CX - 18},446M${CX + 16},423L${CX + 18},446`, lc, 1.4, { opacity: .55 }) })
+        + waistband(K, it.c1, { ease: e, button: '#3a3a44' });
+    } },
+  { id: 'cord', name: '灯芯绒裤', c1: '#8a5a3c', pat: 'cord', pc: '#5c3a26', tags: ['vintage', 'casual', 'autumn', 'preppy'],
+    draw: (env, it) => {
+      const { K } = env;
+      const hem = 664, e = 5.5;
+      return garment(env, it, pantsRight(K, { hem, ease: e, flare: 6 }), { extra: pantsDetails(K, it, { ease: e }) }) + waistband(K, it.c1, { ease: e, loops: true, button: '#d9b45c' });
+    } },
+  { id: 'bermuda', name: '百慕大短裤', c1: '#f2c14e', pat: 'plaid', pc: '#3567b0', tags: ['preppy', 'summer', 'casual', 'vintage'],
+    draw: (env, it) => {
+      const { K } = env;
+      const hem = 556, e = 6;
+      let cuffs = '';
+      for (const s2 of [-1, 1]) cuffs += pantCuff(K, hem - 10, hem, e, 4, hem, s2, it.c1, { inner: '' });
+      return garment(env, it, pantsRight(K, { hem, ease: e, flare: 4 }), { extra: pantsDetails(K, it, { ease: e }) }) + cuffs + waistband(K, it.c1, { ease: e, loops: true, button: '#fff' });
+    } },
+  { id: 'wide', name: '高腰阔腿裤', c1: '#f3ece0', pat: 'none', pc: '#c9bfa6', tags: ['elegant', 'vintage', 'office', 'classic'],
+    draw: (env, it) => {
+      const { K } = env;
+      const hem = 674, e = 6;
+      return garment(env, it, pantsRight(K, { hem, ease: e, flare: 24, waist: 398 }), { extra: pantsDetails(K, it, { ease: e, crease: true, hem, pockets: false }) })
+        + waistband(K, it.c1, { ease: e, y: 398, h: 16, button: '#3a3a44' }) + buttons([CX + 10], [404, 410], '#3a3a44', 2);
+    } },
+  { id: 'cargo', name: '军绿工装裤', c1: '#6b7448', pat: 'none', pc: '#ffffff', tags: ['workwear', 'street', 'cool', 'casual'],
+    draw: (env, it) => {
+      const { K } = env;
+      const hem = 660, e = 7;
+      const lc = lineOf(it.c1);
+      let pk = '';
+      for (const s2 of [-1, 1]) { const a = legEdgeAt(K, 520); const x = CX + s2 * (a.o + e - 4) - (s2 > 0 ? 24 : 0); pk += pocket(x, 522, 24, 34, it.c1, { flap: true, flapFill: shadeOf(it.c1, .05) }); }
+      return garment(env, it, pantsRight(K, { hem, ease: e, flare: 3 }), { extra: pantsDetails(K, it, { ease: e }) + pk })
+        + waistband(K, it.c1, { ease: e, loops: true, button: '#3a3a30' });
+    } },
+  { id: 'denimskirt', name: '牛仔半身裙', c1: '#5b82b8', pat: 'none', pc: '#ffffff', tags: ['casual', 'street', 'vintage', 'summer'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1), st = '#e2a94a', hem = 522, wY = 414;
+      const R = skirtRight(K, { hem, flare: 18, waist: wY });
+      const front = stitch(`M${CX + 5},${wY + 12}V${hem - 2}`, st, 1.1) + ln(`M${CX},${wY + 12}V${hem}`, lc, 1.6, { opacity: .7 });
+      const pk = [-1, 1].map(s2 => { const X = d => r1(CX + s2 * d);
+        return path(`M${X(K.wa - 6)},${wY + 12}Q${X(K.wa + 2)},${wY + 30} ${X(K.hi + 8)},${wY + 38}L${X(K.hi + 8)},${wY + 32}Q${X(K.wa + 4)},${wY + 26} ${X(K.wa - 2)},${wY + 12}Z`, shadowFill(.1))
+          + ln(`M${X(K.wa - 6)},${wY + 12}Q${X(K.wa + 2)},${wY + 30} ${X(K.hi + 8)},${wY + 38}`, lc, 1.7)
+          + stitch(`M${X(K.wa - 10)},${wY + 12}Q${X(K.wa - 2)},${wY + 32} ${X(K.hi + 8)},${wY + 42}`, st, 1); }).join('');
+      const rivets = circ(CX - K.wa + 4, wY + 14, 1.7, { fill: '#c98f3a' }) + circ(CX + K.wa - 4, wY + 14, 1.7, { fill: '#c98f3a' });
+      return paint(ctx, S(R), it.c1, { pat: it.patUrl, shade: 'skirt', extra: front + pk + rivets + stitch(`M${CX - 80},${hem - 6}H${CX + 80}`, st, 1.1) + skirtFolds(K, wY + 44, hem, [-26, 26], 16, lc) })
+        + waistband(K, it.c1, { y: wY, h: 12, loops: true, button: '#c98f3a' }) + stitch(`M${CX - K.wa - 3},${wY + 3}H${CX + K.wa + 3}`, st, 1);
+    } },
+  { id: 'maxipleat', name: '百褶长裙', c1: '#c6a982', pat: 'none', pc: '#ffffff', tags: ['elegant', 'vintage', 'classic', 'autumn'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const wY = 402;
+      return pleatSkirt(ctx, K, it.c1, it.patUrl, { hem: 650, fl: 44, wY }) + waistband(K, shadeOf(it.c1, .08), { h: 13, y: wY });
+    } },
+  { id: 'cargoshorts', name: '工装短裤', c1: '#a8976b', pat: 'none', pc: '#ffffff', tags: ['workwear', 'casual', 'summer', 'street'],
+    draw: (env, it) => {
+      const { K } = env;
+      const hem = 548, e = 7;
+      let pk = '';
+      for (const s2 of [-1, 1]) { const a = legEdgeAt(K, 500); const x = CX + s2 * (a.o + e - 3) - (s2 > 0 ? 22 : 0); pk += pocket(x, 502, 22, 30, it.c1, { flap: true, flapFill: shadeOf(it.c1, .04), stitch: lighten(it.c1, .35) }); }
+      let cuffs = '';
+      for (const s2 of [-1, 1]) cuffs += pantCuff(K, hem - 10, hem, e, 4, hem, s2, it.c1, { inner: '' });
+      return garment(env, it, pantsRight(K, { hem, ease: e, flare: 4 }), { extra: pantsDetails(K, it, { ease: e, knee: false }) + pk }) + cuffs
+        + waistband(K, it.c1, { ease: e, loops: true, button: '#3a3a30' });
+    } },
+  { id: 'shortalls', name: '背带短裤', c1: '#6f93c4', pat: 'none', pc: '#ffffff', forceTuck: true, tags: ['cute', 'casual', 'summer', 'workwear'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const hem = 514, e = 6, st = '#e2b45c';
+      const lc = lineOf(it.c1);
+      const bibW = Math.min(K.ch - 8, 32);
+      const bib = paint(ctx, `M${CX - bibW},346L${CX + bibW},346L${CX + bibW + 2},416L${CX - bibW - 2},416Z`, it.c1, { pat: it.patUrl, extra: stitch(`M${CX - bibW + 3},349H${CX + bibW - 3}`, st, 1) })
+        + pocket(CX - 12, 358, 24, 22, it.c1, { stitch: st });
+      const strap = s2 => { const X = d => CX + s2 * d; return paint(ctx, `M${X(bibW - 10)},348L${X(bibW)},348L${X(K.sh - 10)},306L${X(K.sh - 20)},303Z`, it.c1, { pat: it.patUrl, shade: false, sw: 2.2 })
+        + circ(X(bibW - 5), 352, 4.2, { fill: '#d9c37a', stroke: lineOf('#d9c37a'), 'stroke-width': 1.3 }); };
+      let cuffs = '';
+      for (const s2 of [-1, 1]) cuffs += pantCuff(K, hem - 13, hem + 1, e + 1.5, 4, hem, s2, lighten(it.c1, .18), { inner: '' });
+      return {
+        main: garment(env, it, pantsRight(K, { hem, ease: e, flare: 4, waist: 404, notch: 7 }), { extra: pantsDetails(K, it, { ease: e, fly: false, knee: false }) + ln(`M${CX - K.wa - e},404L${CX + K.wa + e},404`, lc, 2) }) + cuffs,
+        bib: bib + strap(-1) + strap(1) + buttons([CX - K.wa - e + 4, CX + K.wa + e - 4], [414], '#d9c37a', 3),
+      };
+    } },
+);
+
+/* ---------- one-pieces ---------- */
+function bodice(env, it, o = {}) {
+  return garment(env, it, topRight(env.K, Object.assign({ hem: 430, ease: 3, fit: 'fitted' }, o)), o);
+}
+ITEMS.dress.push(
+  { id: 'ballgown', name: '公主蓬蓬裙', c1: '#ffb3cf', c2: '#fff0f6', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'party', 'elegant', 'cute'],
+    sleeve: { len: .22, ease: 3, puff: true },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const hem = 694, fl = 92;
+      const R = skirtRight(K, { hem, flare: fl, waist: 418 });
+      const hx = R[R.length - 2][0];
+      const pts = R.slice(0, -1);
+      for (let i = 1; i < 9; i++) { const x = lerp(hx, mirX(hx), i / 9); pts.push([x, hem + (i % 2 ? 6 : -2)]); }
+      pts.push([mirX(hx), hem, 1], ...mirAll(R.slice(1, -2).reverse()));
+      let folds = '';
+      for (let i = 1; i < 8; i++) { const t = i / 8; folds += `M${r1(lerp(CX - K.wa, CX + K.wa, t))},432Q${r1(lerp(CX - hx, CX + hx, t))},560 ${r1(lerp(CX - hx, CX + hx, t))},${hem}`; }
+      let ruff = '';
+      for (let x = CX - hx + 8; x < CX + hx - 8; x += 18) ruff += `M${x},${hem - 22}q9,12 18,0`;
+      const r = rng(11); let sp = '';
+      for (let i = 0; i < 22; i++) sp += path(starD(CX - hx * .8 + r() * hx * 1.6, 470 + r() * 200, 1.8 + r() * 2.4, .4, 4), { fill: '#fff', opacity: .85 });
+      const skirt = paint(ctx, smooth(pts), it.c1, { pat: it.patUrl, shade: 'skirt', extra: ln(folds, lineOf(it.c1), 1.5, { opacity: .4 }) + ln(ruff, it.c2, 3, { opacity: .9 }) + sp });
+      const body = bodice(env, it, { neck: 'scoop', sleeveless: false, hem: 432 });
+      const bow = flat(smooth([[CX, 428], [CX - 22, 416], [CX - 26, 438, 1], [CX - 6, 432], [CX - 14, 458, 1], [CX, 438], [CX + 14, 458, 1], [CX + 6, 432], [CX + 26, 438, 1], [CX + 22, 416]]), it.c2, lineOf(it.c2), 2.2) + circ(CX, 430, 5, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 2 });
+      return skirt + body + bow;
+    } },
+  { id: 'lolita', name: '洛丽塔', c1: '#f9c9d9', c2: '#ffffff', pat: 'none', pc: '#ffffff', tags: ['sweet', 'cute', 'fantasy', 'vintage'],
+    sleeve: { len: .27, ease: 3, puff: true },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const hem = 566;
+      const tier = (h, fl, col) => {
+        const R = skirtRight(K, { hem: h, flare: fl, waist: 420 });
+        const hx = R[R.length - 2][0];
+        const pts = R.slice(0, -1);
+        const n = 12;
+        for (let i = 1; i < n; i++) { const x = lerp(hx, mirX(hx), i / n); pts.push([x, h + (i % 2 ? 6 : 0), i % 2 === 0]); }
+        pts.push([mirX(hx), h, 1], ...mirAll(R.slice(1, -2).reverse()));
+        return paint(ctx, smooth(pts), col, { pat: col === it.c1 ? it.patUrl : null, shade: 'skirt' });
+      };
+      let lace = '';
+      const hxL = Math.max(K.hi, K.wa) + 3 + 50;
+      for (let x = CX - hxL + 2; x < CX + hxL - 2; x += 9) lace += `M${x},${hem + 2}a4.5,4.5 0 0,0 9,0`;
+      const s = tier(hem + 6, 54, it.c2) + tier(hem, 50, it.c1) + ln(lace, '#fff', 2.4) + tier(520, 40, lighten(it.c1, .2));
+      const lc = lineOf(it.c1);
+      const body = bodice(env, it, { neck: 'square', hem: 432 }) + ln(`M${CX - 22},326H${CX + 22}`, '#fff', 3) + ln(`M${CX},330V420`, lc, 1.2, { opacity: .5 });
+      const bow = (y, sc) => flat(smooth([[CX, y], [CX - 16 * sc, y - 9 * sc], [CX - 18 * sc, y + 8 * sc, 1], [CX - 4, y + 3], [CX - 10 * sc, y + 22 * sc, 1], [CX, y + 6], [CX + 10 * sc, y + 22 * sc, 1], [CX + 4, y + 3], [CX + 18 * sc, y + 8 * sc, 1], [CX + 16 * sc, y - 9 * sc]]), it.c2, lineOf(it.c2), 2) + circ(CX, y + 1, 3.6 * sc, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1.6 });
+      return s + body + bow(334, 1) + bow(372, .8) + bow(404, .7);
+    } },
+  { id: 'slip', name: '吊带长裙', c1: '#c4b0f0', pat: 'none', pc: '#ffffff', tags: ['elegant', 'party', 'summer'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const R = topRight(K, { neck: 'v', vDepth: 336, sleeveless: true, strap: 3, hem: 452, ease: 3 }).slice(0, -2);
+      const hx = Math.max(K.hi, K.wa) + 3;
+      const pts = [...R, [CX + K.wa + 3, 412], [CX + hx + 2, 456], [CX + hx + 18, 600], [CX + hx + 24, 684, 1], [CX, 688]];
+      const lc = lineOf(it.c1);
+      return paint(ctx, S(pts), it.c1, { pat: it.patUrl, shade: 'skirt', extra: ln(`M${CX - 20},470Q${CX - 26},580 ${CX - 34},684M${CX + 14},470Q${CX + 18},580 ${CX + 22},684M${CX + 36},500Q${CX + 46},600 ${CX + 52},684`, lc, 1.3, { opacity: .35 }) + path(`M${CX - 60},300L${CX - 20},300L${CX - 46},688L${CX - 70},688Z`, { fill: '#fff', opacity: .14 }) });
+    } },
+  { id: 'pinafore', name: '背带裙', c1: '#3a5a8c', pat: 'plaid', pc: '#e8c547', overTop: true, tags: ['preppy', 'cute', 'vintage', 'sweet'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const bibW = Math.min(K.ch - 10, 30);
+      const skirt = paint(ctx, skirtPath(K, { hem: 548, flare: 30, waist: 412 }), it.c1, { pat: it.patUrl, shade: 'skirt' });
+      const bib = paint(ctx, `M${CX - bibW},350L${CX + bibW},350L${CX + bibW + 3},418L${CX - bibW - 3},418Z`, it.c1, { pat: it.patUrl });
+      const strap = s2 => { const X = d => CX + s2 * d; return paint(ctx, `M${X(bibW - 9)},352L${X(bibW)},352L${X(K.sh - 11)},307L${X(K.sh - 20)},304Z`, it.c1, { pat: it.patUrl, shade: false, sw: 2.2 }) + circ(X(bibW - 5), 356, 3.6, { fill: '#fff6dc', stroke: '#9a8a5a', 'stroke-width': 1.4 }); };
+      return skirt + bib + strap(-1) + strap(1) + waistband(K, it.c1, { y: 410, h: 10 });
+    } },
+  { id: 'qipao', name: '旗袍', c1: '#c8102e', pat: 'none', pc: '#f2c75c', tags: ['chinese', 'elegant', 'party', 'vintage'],
+    sleeve: { len: .17, ease: 3 },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const gold = '#f2c75c';
+      const hx = Math.max(K.hi, K.wa) + 3;
+      const R = topRight(K, { neck: 'turtle', hem: 452, ease: 3 }).slice(0, -2);
+      const pts = [...R, [CX + K.wa + 3, 412], [CX + hx + 1, 456], [CX + hx - 2, 540], [CX + hx - 6, 596, 1], [CX, 598]];
+      const lc = lineOf(it.c1);
+      const w = K.neck + 4;
+      const collar = flat(`M${CX - w},272Q${CX},278 ${CX + w},272L${CX + w + 1},292Q${CX},300 ${CX - w - 1},292Z`, it.c1, lc, 2.4) + ln(`M${CX - w},292Q${CX},300 ${CX + w},292`, gold, 2);
+      const opening = ln(`M${CX},298C${CX + 14},310 ${CX + 30},314 ${CX + K.sh - 4},334`, gold, 2.4);
+      const frogs = [[CX + 10, 306], [CX + 26, 316], [CX + K.sh - 10, 330]].map(([x, y]) => ln(`M${x - 5},${y - 2}h10M${x - 3},${y - 4}a2.5,2.5 0 1,0 0,4`, gold, 2)).join('');
+      const slit = ln(`M${CX + hx - 4},560L${CX + hx - 6},596`, lc, 1.8);
+      const flower = (x, y) => { let s = ''; for (let i = 0; i < 5; i++) { const a = i * 1.2566; s += ell(x + Math.cos(a) * 6, y + Math.sin(a) * 6, 5, 3.4, { fill: gold, opacity: .9, transform: `rotate(${r1(a * 57.3)} ${r1(x + Math.cos(a) * 6)} ${r1(y + Math.sin(a) * 6)})` }); } return s + circ(x, y, 3, { fill: '#fff3c4' }); };
+      return paint(ctx, S(pts), it.c1, { pat: it.patUrl, extra: flower(CX - 24, 470) + flower(CX + 30, 540) + ln(`M${CX - 24},470q10,30 -4,60M${CX + 30},540q-10,20 6,40`, gold, 1.4, { opacity: .7 }) })
+        + collar + opening + frogs + slit;
+    } },
+  { id: 'magical', name: '魔法少女裙', c1: '#ff9ecf', c2: '#ffffff', pat: 'none', pc: '#ffe066', tags: ['fantasy', 'cute', 'party', 'sweet'],
+    sleeve: { len: .22, ease: 3, puff: true },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const layer = (hem, fl, col) => {
+        const R = skirtRight(K, { hem, flare: fl, waist: 420 });
+        const hx = R[R.length - 2][0];
+        const pts = R.slice(0, -1);
+        for (let i = 1; i < 8; i++) { const x = lerp(hx, mirX(hx), i / 8); pts.push([x, hem - (i % 2 ? 0 : 8), i % 2 === 1]); }
+        pts.push([mirX(hx), hem, 1], ...mirAll(R.slice(1, -2).reverse()));
+        return paint(ctx, smooth(pts), col, { shade: 'skirt' });
+      };
+      const sk = layer(540, 62, it.c2) + layer(526, 54, it.c1) + layer(498, 40, lighten(it.c1, .3));
+      const collar = flat(S([[CX, 346, 1], [CX + 16, 326], [CX + K.neck + 6, 298, 1], [CX + K.sh, 318], [CX + K.sh + 4, 336, 1], [CX + 20, 348]]), it.c2, lineOf(it.c2), 2.2);
+      const brooch = path(heartD(CX, 352, 10), { fill: '#ff4f8b', stroke: lineOf('#ff4f8b'), 'stroke-width': 2 }) + path(starD(CX - 3, 348, 3, .4, 4), { fill: '#fff' });
+      const bowBack = flat(smooth([[CX, 420], [CX - 34, 404], [CX - 40, 432, 1], [CX - 8, 426], [CX - 22, 470, 1], [CX, 432], [CX + 22, 470, 1], [CX + 8, 426], [CX + 40, 432, 1], [CX + 34, 404]]), it.pc, lineOf(it.pc), 2.2);
+      return sk + bodice(env, it, { neck: 'v', vDepth: 350, hem: 432 }) + collar + bowBack + brooch;
+    } },
+  { id: 'boiler', name: '连体工装服', c1: '#3e4f6e', pat: 'none', pc: '#ffffff', tags: ['workwear', 'vintage', 'cool', 'street'],
+    sleeve: { len: .62, ease: 5, roll: true },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const e = 6, hem = 652;
+      const lc = lineOf(it.c1), st = '#e2b45c';
+      const pants = garment(env, it, pantsRight(K, { hem, ease: e, flare: 3, waist: 404 }), { extra: pantsDetails(K, it, { ease: e, fly: false }) });
+      const top = garment(env, it, topRight(K, { neck: 'collar', hem: 430, ease: e }), {
+        extra: ln(`M${CX},300V430`, lc, 1.8) + stitch(`M${CX - 4},304V430M${CX + 4},304V430`, st, 1)
+          + pocket(CX - 40, 336, 24, 26, it.c1, { flap: true, stitch: st }) + pocket(CX + 16, 336, 24, 26, it.c1, { flap: true, stitch: st }) });
+      const belt = flat(`M${CX - K.wa - e - 1},410H${CX + K.wa + e + 1}V424H${CX - K.wa - e - 1}Z`, it.c1, lc, 2.2) + path(`M${CX - 8},409h16v16h-16z`, { fill: 'none', stroke: '#c9b26a', 'stroke-width': 2.4 });
+      let cuffs = '';
+      for (const s2 of [-1, 1]) cuffs += pantCuff(K, hem - 12, hem, e, 3, hem, s2, it.c1);
+      return pants + cuffs + top + belt + shirtCollar(ctx, K, it.c1, { wide: true });
+    } },
+  { id: 'shirtdress', name: '衬衫连衣裙', c1: '#9cc3e6', pat: 'gingham', pc: '#ffffff', tags: ['vintage', 'casual', 'preppy', 'summer'],
+    sleeve: { len: .5, ease: 3.5, roll: true },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const skirt = paint(ctx, skirtPath(K, { hem: 566, flare: 24, waist: 414 }), it.c1, { pat: it.patUrl, shade: 'skirt', extra: placket(K, 420, 566, it.c1, 4) });
+      const top = bodice(env, it, { neck: 'collar', hem: 432, extra: placket(K, 312, 432, it.c1, 3) });
+      const belt = flat(`M${CX - K.wa - 4},412H${CX + K.wa + 4}V424H${CX - K.wa - 4}Z`, '#7a5134', lineOf('#7a5134'), 2) + path(`M${CX - 7},410h14v16h-14z`, { fill: 'none', stroke: '#e0c070', 'stroke-width': 2.2 });
+      return skirt + top + belt + shirtCollar(ctx, K, it.c1, {});
+    } },
+  { id: 'teadress', name: '碎花茶歇裙', c1: '#fbe6cf', pat: 'flower', pc: '#e4596b', tags: ['vintage', 'sweet', 'summer', 'elegant'],
+    sleeve: { len: .25, ease: 3, puff: true },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1), hem = 604;
+      const folds = ln(`M${CX - 18},440Q${CX - 26},520 ${CX - 38},${hem}M${CX + 12},440Q${CX + 16},520 ${CX + 22},${hem}M${CX + 34},450Q${CX + 46},530 ${CX + 56},${hem}`, lc, 1.3, { opacity: .35 });
+      const skirt = paint(ctx, skirtPath(K, { hem, flare: 36, waist: 420 }), it.c1, { pat: it.patUrl, shade: 'skirt', extra: folds });
+      const body = bodice(env, it, { neck: 'v', vDepth: 346, hem: 432, extra: placket(K, 350, 430, it.c1, 3, CX, { button: '#fff8ec' }) });
+      const sash = flat(`M${CX - K.wa - 4},418H${CX + K.wa + 4}V428H${CX - K.wa - 4}Z`, it.pc, lineOf(it.pc), 2);
+      const tie = flat(smooth([[CX - 24, 424], [CX - 36, 416], [CX - 40, 430, 1], [CX - 28, 428], [CX - 34, 452, 1], [CX - 24, 430]]), it.pc, lineOf(it.pc), 1.8);
+      return skirt + body + sash + tie;
+    } },
+  { id: 'sundress', name: '格子吊带裙', c1: '#d94a5c', pat: 'gingham', pc: '#ffffff', tags: ['summer', 'cute', 'sweet', 'casual'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1), hem = 548;
+      const skirt = paint(ctx, skirtPath(K, { hem, flare: 34, waist: 422 }), it.c1, { pat: it.patUrl, shade: 'skirt',
+        extra: ln(`M${CX - 14},440L${CX - 26},${hem}M${CX + 14},440L${CX + 26},${hem}`, lc, 1.2, { opacity: .3 }) });
+      const body = bodice(env, it, { neck: 'square', sleeveless: true, strap: 4, hem: 434 });
+      const bow = flat(smooth([[CX, 326], [CX - 10, 320], [CX - 11, 332, 1], [CX - 2, 328], [CX + 2, 328], [CX + 11, 332, 1], [CX + 10, 320]]), '#fff6f0', lineOf('#fff6f0'), 1.6);
+      return skirt + body + ln(`M${CX - K.wa - 3},${424}H${CX + K.wa + 3}`, lc, 1.6, { opacity: .6 }) + bow;
+    } },
+  { id: 'sweaterdress', name: '毛衣连衣裙', c1: '#c79a72', pat: 'none', pc: '#ffffff', tags: ['winter', 'elegant', 'casual', 'classic'],
+    sleeve: { len: .96, ease: 4.5, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const hx = Math.max(K.hi, K.wa) + 4, hem = 560, lc = lineOf(it.c1), w = K.neck + 5;
+      const R = topRight(K, { neck: 'turtle', hem: 452, ease: 4.5 }).slice(0, -2);
+      const pts = [...R, [CX + K.wa + 5, 412], [CX + hx + 2, 456], [CX + hx + 5, hem, 1], [CX, hem + 2]];
+      let rib = '';
+      for (let x = CX - 60; x <= CX + 60; x += 7) rib += `M${x},300V${hem - 12}`;
+      const body = paint(ctx, S(pts), it.c1, { pat: it.patUrl, extra: ln(rib, lc, 1.2, { opacity: .3 }) + ribBand(K, hem - 12, hem + 2, it.c1) + sideFolds(K, 470, .8) });
+      const collar = flat(`M${CX - w},270Q${CX},276 ${CX + w},270L${CX + w + 2},300Q${CX},310 ${CX - w - 2},300Z`, shadeOf(it.c1, .05), lc, 2.6)
+        + ln(`M${CX - w + 4},274V300M${CX - w + 11},275V303M${CX - 3},276V305M${CX + 4},276V305M${CX + w - 11},275V303M${CX + w - 4},274V300`, lc, 1.1, { opacity: .45 });
+      return body + collar;
+    } },
+  { id: 'sailordress', name: '水手领连衣裙', c1: '#ffffff', c2: '#22345e', pat: 'none', pc: '#9fb7e8', tags: ['cute', 'preppy', 'sweet', 'summer'],
+    sleeve: { len: .3, ease: 4, cuff: 'c2' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const skirt = pleatSkirt(ctx, K, it.c2, null, { hem: 546, fl: 30, wY: 420 });
+      const body = bodice(env, it, { neck: 'v', vDepth: 356, hem: 432 });
+      return skirt + body + waistband(K, it.c2, { h: 10, y: 420 }) + sailorCollar(K, it.c2);
+    } },
+);
+
+/* ---- wear_outer.js ---- */
+/* ===== wear_outer.js — outerwear (layered over tops) ===== */
+/* right front panel of an open jacket. o: ease, hem, gapHem, gapMid, vEnd, closeAt, flare */
+function jacketPanel(K, o = {}) {
+  const e = o.ease ?? 7, hem = o.hem ?? 474, fl = o.flare ?? 0;
+  const hw = Math.max(K.hi, K.wa, K.ch - 2) + e;
+  const pts = [[CX + K.neck + 5, 293, 1], [CX + K.sh - 11, 301], [CX + K.sh + 2, 309.5], [CX + K.sh, 328], [CX + K.ch + e + 1, 350], [CX + K.ch + e, 372],
+    [CX + Math.max(K.wa, K.ch - 6) + e + 1, 412], [CX + Math.max(K.hi, K.wa) + e + fl * .5, 456]];
+  if (hem > 470) pts.push([CX + hw + fl * .8, (456 + hem) / 2]);
+  pts.push([CX + hw + fl + 1, hem, 1]);
+  if (o.cutaway) pts.push([CX + o.gapHem, hem + 1, 1], [CX + 3, o.closeAt + 14], [CX + 1, o.closeAt, 1]);
+  else if (o.closeAt) pts.push([CX - (o.overlap ?? 6), hem + 1, 1], [CX - (o.overlap ?? 6), o.closeAt, 1]);
+  else pts.push([CX + (o.gapHem ?? 18), hem + 1, 1]);
+  pts.push([CX + (o.gapMid ?? 12), o.vEnd ?? 352, o.closeAt ? 1 : 0]);
+  return pts;
+}
+function jacket(env, it, o = {}) {
+  const { K, ctx } = env;
+  const R = jacketPanel(K, o);
+  const col = o.col || it.c1;
+  const dR = smooth(R), dL = smooth(mirAll(R));
+  const folds = o.folds === false ? '' : sideFolds(K, o.hem ?? 474, .8);
+  const right = paint(ctx, dR, col, { pat: it.patUrl, extra: (o.extraR || '') + folds });
+  const left = paint(ctx, dL, col, { pat: it.patUrl, extra: (o.extraL || '') + folds });
+  // the panels shade the shirt in the opening and the hips under the hem
+  const cast = env.castOnTop ? dropShadow(dR + dL, env.castOnTop, .14, 2, 2.8) : '';
+  return cast + (o.leftOver ? right + left : left + right);
+}
+/* a closed coat painted panel by panel: the cast shadow of both panels on the shirt / trousers under it */
+const panelsCast = (env, R) => env.castOnTop ? dropShadow(smooth(R) + smooth(mirAll(R)), env.castOnTop, .14, 2, 2.8) : '';
+function lapels(K, col, o = {}) {
+  const roll = o.roll ?? 398, notch = o.notch ?? 320, w = o.w ?? 38, lc = lineOf(col);
+  const right = [[CX + K.neck + 4, 290, 1], [CX + K.neck + 15, 297], [CX + w - 5, notch - 7, 1], [CX + w - 10, notch + 1, 1], [CX + w + 1.5, notch + 2.5, 1], [CX + w - 2, notch + 22],
+    [CX + 3, roll, 1], [CX + K.neck + 4, 305]];
+  const gorge = s => { const X = x => CX + s * (x - CX); return ln(`M${r1(X(CX + w - 10))},${notch + 1}L${r1(X(CX + K.neck + 9))},${302}`, lc, 1.4, { opacity: .7 }); };
+  const one = (pts, s, lit) => { const d = smooth(pts);
+    return path(d, shadowFill(.2, { transform: 'translate(2,2.6)' })) + flat(d, lighten(col, .04), lc, 2.5) + gorge(s)
+      + ln(smooth(pts.slice(4, 7), false), lighten(col, .3), 1.5, { opacity: lit, transform: `translate(${-s * 2.2},0)` }); };
+  return one(right, 1, .3) + one(mirAll(right), -1, .65);
+}
+function flatCollar(K, col, o = {}) {
+  const lc = lineOf(col), w = o.w ?? 30, d = o.depth ?? 330;
+  const right = [[CX + K.neck + 2, 286], [CX + K.neck + 26, 296], [CX + K.sh - 2, 312], [CX + w + 4, d, 1], [CX + 13, d - 18], [CX + K.neck + 4, 300]];
+  const one = d => path(d, shadowFill(.14, { transform: 'translate(1.4,2.4)' })) + flat(d, col, lc, 2.4);
+  return one(smooth(right)) + one(smooth(mirAll(right)));
+}
+function elbowPatch(ctx, sl, P, arm, K) {
+  const p = cutPolyline(arm.pts, K.L1 + 4), q = p[p.length - 1], q0 = p[p.length - 2];
+  const ang = Math.atan2(q.y - q0.y, q.x - q0.x) * 180 / Math.PI;
+  return ell(q.x, q.y, 14, K.arm * .85, { fill: '#6b4a34', stroke: '#3e2a1e', 'stroke-width': 1.6, transform: `rotate(${r1(ang)} ${r1(q.x)} ${r1(q.y)})` })
+    + ell(q.x, q.y, 10.5, K.arm * .6, { fill: 'none', stroke: '#c9a27c', 'stroke-width': 1, 'stroke-dasharray': '2 2', transform: `rotate(${r1(ang)} ${r1(q.x)} ${r1(q.y)})` });
+}
+function letterF(x, y, s, col, edge) {
+  const d = `M${x},${y}h${16 * s}v${6 * s}h${-10 * s}v${5 * s}h${8 * s}v${6 * s}h${-8 * s}v${10 * s}h${-6 * s}z`;
+  return path(d, { fill: col, stroke: edge, 'stroke-width': 2.6 * s, 'stroke-linejoin': 'round', 'paint-order': 'stroke' });
+}
+
+ITEMS.outer.push(
+  { id: 'blazer', name: '藏青西装外套', c1: '#1f2a4c', pat: 'none', pc: '#8d9bbd', closed: true, tags: ['preppy', 'classic', 'office', 'elegant'],
+    sleeve: { len: .9, ease: 4.5 },
+    draw: (env, it) => {
+      const { K } = env;
+      const gold = '#e2b84e', lc = lineOf(it.c1);
+      const body = jacket(env, it, { ease: 5, hem: 462, cutaway: true, gapHem: 24, closeAt: 428, vEnd: 400, gapMid: -3, leftOver: true });
+      // hip flap pockets, as big and as high as in the reference
+      const flap = s2 => {
+        const X = d => CX + s2 * d, x0 = K.wa - 21, x1 = K.wa + 5;
+        return path(`M${X(x0)},421L${X(x1)},421L${X(x1 + .5)},433Q${X((x0 + x1) / 2)},435 ${X(x0)},433Z`, shadowFill(.18, { transform: 'translate(1.4,1.8)' }))
+          + flat(`M${X(x0)},419L${X(x1)},419L${X(x1 + .5)},432Q${X((x0 + x1) / 2)},434 ${X(x0)},432Z`, it.c1, lc, 2);
+      };
+      const welt = flat(`M${CX + 20},354L${CX + 42},352L${CX + 42.5},357L${CX + 20.5},359Z`, it.c1, lc, 1.8);
+      const square = flat(`M${CX + 23},355L${CX + 27},346L${CX + 31},351L${CX + 35},345L${CX + 39},354Z`, '#fbf8f1', lineOf('#fbf8f1'), 1.6);
+      return body + lapels(K, it.c1, { roll: 400, notch: 318, w: 40 }) + flap(-1) + flap(1) + square + welt
+        + buttons([CX + 1], [404, 429], gold, 5.4) + ell(CX - .6, 402.2, 1.8, 1.4, { fill: '#fff7d6', opacity: .9 }) + ell(CX - .6, 427.2, 1.8, 1.4, { fill: '#fff7d6', opacity: .9 });
+    } },
+  { id: 'tweed', name: '粗花呢夹克', c1: '#7f6e55', pat: 'herring', pc: '#4e4233', tags: ['preppy', 'classic', 'vintage', 'autumn'],
+    sleeve: { len: .95, ease: 6 }, sleeveDeco: elbowPatch,
+    draw: (env, it) => {
+      const { K } = env;
+      const body = jacket(env, it, { hem: 486, cutaway: true, gapHem: 26, closeAt: 402, vEnd: 380 });
+      const flap = s => { const X = d => CX + s * d; return path(`M${X(K.wa - 18)},444h${s * 28}v9h${-s * 28}z`, { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.6 }); };
+      return body + lapels(K, it.c1) + flap(-1) + flap(1) + buttons([CX + 2], [402, 432], '#5a3e2b', 3.2);
+    } },
+  { id: 'varsity', name: '学院棒球夹克', c1: '#2f4e8a', c2: '#f3ead6', pat: 'none', pc: '#ffffff', tags: ['preppy', 'sporty', 'street', 'vintage'],
+    sleeve: { len: .95, ease: 6.5, color: 'c2', cuff: 'rib' },
+    draw: (env, it) => {
+      const { K } = env;
+      const rib = (y0, y1) => path(`M${CX - 150},${y0}H${CX + 150}V${y1}H${CX - 150}Z`, { fill: it.c1 }) + ln(`M${CX - 150},${y0 + 4}H${CX + 150}M${CX - 150},${y0 + 8}H${CX + 150}`, it.c2, 2);
+      const hem = jacket(env, it, { hem: 470, gapHem: 10, gapMid: 8, vEnd: 330, col: it.c1, extraR: rib(458, 471), extraL: rib(458, 471) });
+      const neckRib = ln(`M${CX - K.neck - 6},292Q${CX - 16},322 ${CX - 8},336M${CX + K.neck + 6},292Q${CX + 16},322 ${CX + 8},336`, it.c1, 9) + ln(`M${CX - K.neck - 6},292Q${CX - 16},322 ${CX - 8},336M${CX + K.neck + 6},292Q${CX + 16},322 ${CX + 8},336`, it.c2, 2);
+      const snaps = buttons([CX - 12, CX + 12], [352, 382, 412, 442], '#e8e2d2', 2.4);
+      return hem + neckRib + snaps + letterF(CX - K.ch + 6, 344, 1.25, it.c2, '#c9374b');
+    } },
+  { id: 'chore', name: '复古工装夹克', c1: '#c08a4a', c2: '#5a3a28', pat: 'none', pc: '#ffffff', tags: ['workwear', 'vintage', 'casual', 'autumn'],
+    sleeve: { len: .95, ease: 7, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K } = env;
+      const st = darken(it.c1, .35);
+      const body = jacket(env, it, { hem: 498, gapHem: 16, vEnd: 340 });
+      const pk = (x, y, w, h) => pocket(x, y, w, h, it.c1, { stitch: st });
+      return body + flatCollar(K, it.c2, { w: 32, depth: 334 }) + pk(CX - K.ch, 352, 24, 26) + pk(CX - K.hi - 2, 432, 30, 34) + pk(CX + K.hi - 28, 432, 30, 34)
+        + buttons([CX + 14], [352, 386, 420, 454], '#3a3a40', 3);
+    } },
+  { id: 'denimjk', name: '牛仔夹克', c1: '#5677a8', pat: 'none', pc: '#ffffff', tags: ['workwear', 'street', 'casual', 'vintage'],
+    sleeve: { len: .95, ease: 6.5, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K } = env;
+      const st = '#e2b45c';
+      const pleat = s => stitch(`M${CX + s * 26},372L${CX + s * 28},456`, st, 1.2) + stitch(`M${CX + s * 31},372L${CX + s * 33},456`, st, 1.2);
+      const yoke = stitch(`M${CX - K.ch - 4},360L${CX - 14},352M${CX + K.ch + 4},360L${CX + 14},352`, st, 1.2);
+      const body = jacket(env, it, { hem: 466, gapHem: 18, vEnd: 342 });
+      const band = s => { const X = d => CX + s * d; const hw = Math.max(K.hi, K.wa) + 7; return flat(`M${X(18)},452L${X(hw + 1)},452L${X(hw + 1)},466L${X(18)},466Z`, it.c1, lineOf(it.c1), 2); };
+      return body + yoke + pleat(-1) + pleat(1) + pocket(CX - K.ch - 2, 362, 22, 20, it.c1, { flap: true, stitch: st }) + pocket(CX + K.ch - 20, 362, 22, 20, it.c1, { flap: true, stitch: st })
+        + band(-1) + band(1) + flatCollar(K, it.c1) + buttons([CX - 14, CX + 14], [352, 392, 432, 459], '#c98f3a', 2.8);
+    } },
+  { id: 'a2', name: 'A-2飞行夹克', c1: '#6b4130', c2: '#3a2722', pat: 'none', pc: '#ffffff', tags: ['vintage', 'cool', 'workwear', 'classic'],
+    sleeve: { len: .95, ease: 6.5, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const right = jacketPanel(K, { hem: 468, closeAt: 330, overlap: 0, vEnd: 300, ease: 7 });
+      const lc = lineOf(it.c1);
+      const body = panelsCast(env, right) + paint(ctx, smooth(right), it.c1, { shade: 'lr' }) + paint(ctx, smooth(mirAll(right)), it.c1, { shade: 'lr' });
+      const hw = Math.max(K.hi, K.wa) + 8;
+      const band = flat(`M${CX - hw},454H${CX + hw}V470H${CX - hw}Z`, it.c2, lineOf(it.c2), 2.2) + ln(Array.from({ length: Math.round(hw * 2 / 5) }, (_, i) => `M${CX - hw + 3 + i * 5},456V468`).join(''), lineOf(it.c2), 1, { opacity: .5 });
+      const zip = ln(`M${CX},300V454`, '#c8b98a', 2.2) + ln(`M${CX},300V454`, '#6a5a3a', 1, { 'stroke-dasharray': '1.5 1.5' });
+      const flapPk = s => { const X = d => CX + s * d; return flat(`M${X(18)},404L${X(K.wa + 2)},404L${X(K.wa + 4)},420L${X(18)},420Z`, it.c1, lc, 2) + circ(X(K.wa / 2 + 10), 414, 2.2, { fill: '#2a1a14' }); };
+      const ep = s => { const X = d => CX + s * d; return flat(`M${X(K.neck + 8)},300L${X(K.sh - 4)},312L${X(K.sh - 6)},320L${X(K.neck + 7)},308Z`, it.c1, lc, 1.8) + circ(X(K.neck + 12), 304, 1.8, { fill: '#2a1a14' }); };
+      const shine = path(`M${CX - K.ch + 6},350Q${CX - K.ch + 12},400 ${CX - K.ch + 8},444`, { fill: 'none', stroke: '#fff', 'stroke-width': 3, opacity: .2 });
+      return body + band + zip + flapPk(-1) + flapPk(1) + ep(-1) + ep(1) + flatCollar(K, it.c1, { w: 30, depth: 326 }) + shine;
+    } },
+  { id: 'trench', name: '经典风衣', c1: '#cfb47f', pat: 'none', pc: '#ffffff', tags: ['classic', 'elegant', 'office', 'autumn'],
+    sleeve: { len: .95, ease: 7, cuff: 'c2' },
+    c2: '#bfa26a',
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1);
+      const R = jacketPanel(K, { hem: 604, closeAt: 330, overlap: 18, vEnd: 300, ease: 8, flare: 18 });
+      const body = panelsCast(env, R) + paint(ctx, smooth(mirAll(R)), it.c1, { shade: 'lr' }) + paint(ctx, smooth(R), it.c1, { shade: 'lr' });
+      const belt = flat(`M${CX - K.wa - 12},412H${CX + K.wa + 12}V424H${CX - K.wa - 12}Z`, it.c1, lc, 2.2) + path(`M${CX - 30},409h14v18h-14z`, { fill: 'none', stroke: '#6a5a3a', 'stroke-width': 2.4 }) + ln(`M${CX - 24},424q-4,24 4,40`, it.c1, 8) + ln(`M${CX - 24},424q-4,24 4,40`, lc, 1.2, { opacity: .5 });
+      const btn = buttons([CX - 2, CX + 22], [348, 376, 400], '#4a3a2a', 3);
+      const flap = flat(`M${CX + K.neck + 8},300L${CX + K.sh + 2},316L${CX + K.sh},350L${CX + K.neck + 14},338Z`, it.c1, lc, 1.8);
+      return body + flap + lapels(K, it.c1, { roll: 330, notch: 318, w: 40 }) + btn + belt + ln(`M${CX - 18},430L${CX - 16},600`, lc, 1.4, { opacity: .5 });
+    } },
+  { id: 'cardigan', name: '学院开衫', c1: '#7b8f5c', pat: 'none', pc: '#ffffff', tags: ['preppy', 'casual', 'vintage', 'autumn'],
+    sleeve: { len: .95, ease: 5.5, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K } = env;
+      const lc = lineOf(it.c1);
+      const rib = ln(`M${CX - 150},467H${CX + 150}`, shadeOf(it.c1, .1), 14) + ln(Array.from({ length: 60 }, (_, i) => `M${CX - 150 + i * 5},461v12`).join(''), lc, .9, { opacity: .35 });
+      const body = jacket(env, it, { hem: 476, gapHem: 6, gapMid: 4, vEnd: 372, ease: 5.5, extraR: rib, extraL: rib });
+      const edge = ln(`M${CX - K.neck - 5},294L${CX - 4},372L${CX - 6},476M${CX + K.neck + 5},294L${CX + 4},372L${CX + 6},476`, shadeOf(it.c1, .1), 7);
+      return body + edge + ln(`M${CX - K.neck - 5},294L${CX - 4},372L${CX - 6},476M${CX + K.neck + 5},294L${CX + 4},372L${CX + 6},476`, lc, 1, { opacity: .5 }) + buttons([CX + 5], [388, 414, 440, 464], '#f2e6c8', 2.6)
+        + pocket(CX - K.hi + 4, 432, 24, 22, it.c1);
+    } },
+  { id: 'vest', name: '菱格毛衣背心', c1: '#efe6d2', pat: 'argyle', pc: '#355690', tags: ['preppy', 'classic', 'vintage', 'office'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const R = topRight(K, { neck: 'v', vDepth: 372, sleeveless: true, strap: 22, hem: 466, ease: 4.5 });
+      const lc = lineOf(it.c1);
+      return paint(ctx, S(R), it.c1, { pat: it.patUrl, extra: ribBand(K, 454, 467, it.c1) })
+        + ln(`M${CX - K.neck - 6},296L${CX},372L${CX + K.neck + 6},296`, shadeOf(it.c1, .1), 6) + ln(`M${CX - K.neck - 9},296L${CX},376L${CX + K.neck + 9},296`, lc, 1.2, { opacity: .5 });
+    } },
+  { id: 'waistcoat', name: '西装马甲', c1: '#5a5f70', pat: 'none', pc: '#8a8fa0', tags: ['classic', 'office', 'vintage', 'elegant'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const hw = Math.max(K.wa, K.hi - 4) + 4;
+      const R = [[CX, 360, 1], [CX + K.neck + 6, 296, 1], [CX + K.sh - 18, 308, 1], [CX + K.sh - 12, 336], [CX + K.ch + 3, 368], [CX + K.wa + 4, 412], [CX + hw, 448, 1], [CX + 12, 462, 1], [CX, 474, 1]];
+      const lc = lineOf(it.c1);
+      return paint(ctx, S(R), it.c1, { pat: it.patUrl, extra: ln(`M${CX - K.wa + 4},420h18M${CX + K.wa - 22},420h18`, lc, 2) })
+        + buttons([CX], [372, 392, 412, 432, 452], '#2e2e36', 2.4) + ln(`M${CX + 12},400Q${CX + 24},404 ${CX + K.wa - 2},420`, '#d8b45a', 1.4);
+    } },
+  { id: 'duffle', name: '牛角扣大衣', c1: '#c79a5c', pat: 'none', pc: '#ffffff', tags: ['classic', 'preppy', 'winter', 'cute'],
+    sleeve: { len: .95, ease: 7.5 },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1);
+      const R = jacketPanel(K, { hem: 552, closeAt: 300, overlap: 4, vEnd: 296, ease: 8, flare: 14 });
+      const body = panelsCast(env, R) + paint(ctx, smooth(mirAll(R)), it.c1, { shade: 'lr' }) + paint(ctx, smooth(R), it.c1, { shade: 'lr' });
+      const hood = hoodBack(ctx, K, shadeOf(it.c1, .06));
+      const yoke = flat(S([[CX, 292], [CX + K.neck + 8, 290], [CX + K.sh + 6, 318], [CX + K.sh + 4, 340, 1], [CX + 30, 346], [CX, 344]]), shadeOf(it.c1, .04), lc, 2.2);
+      const toggle = y => ln(`M${CX - 16},${y}H${CX + 16}`, '#3a2a20', 1.6) + path(`M${CX - 9},${y - 3}h18a3,3 0 0,1 0,6h-18a3,3 0 0,1 0,-6z`, { fill: '#e8d9b8', stroke: '#8a7552', 'stroke-width': 1.4 });
+      return { hood, main: body + yoke + toggle(372) + toggle(410) + toggle(448) + pocket(CX - K.hi - 8, 470, 32, 34, it.c1, { flap: true }) + pocket(CX + K.hi - 24, 470, 32, 34, it.c1, { flap: true }) };
+    } },
+  { id: 'tang', name: '盘扣唐装', c1: '#b8202e', c2: '#f2c75c', pat: 'none', pc: '#d9a63a', tags: ['chinese', 'classic', 'party', 'winter'],
+    sleeve: { len: .95, ease: 6.5, cuff: 'c2' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1), gold = it.c2;
+      const R = jacketPanel(K, { hem: 482, closeAt: 300, overlap: 0, vEnd: 296, ease: 7 });
+      const body = panelsCast(env, R) + paint(ctx, smooth(mirAll(R)), it.c1, { pat: it.patUrl }) + paint(ctx, smooth(R), it.c1, { pat: it.patUrl });
+      const w = K.neck + 5;
+      const collar = flat(`M${CX - w},274Q${CX},280 ${CX + w},274L${CX + w + 1},294Q${CX},302 ${CX - w - 1},294Z`, it.c1, lc, 2.4) + ln(`M${CX - w},294Q${CX},302 ${CX + w},294`, gold, 2);
+      const frog = y => ln(`M${CX - 13},${y}h26`, gold, 2.2) + circ(CX - 13, y, 3, { fill: 'none', stroke: gold, 'stroke-width': 2 }) + circ(CX + 13, y, 3, { fill: 'none', stroke: gold, 'stroke-width': 2 }) + circ(CX, y, 2.4, { fill: gold });
+      const medal = (x, y) => circ(x, y, 13, { fill: 'none', stroke: gold, 'stroke-width': 1.6, opacity: .8 }) + path(starD(x, y, 8, .5, 6), { fill: gold, opacity: .55 });
+      return body + ln(`M${CX},300V482`, gold, 2) + collar + [324, 352, 380, 408, 436].map(frog).join('') + medal(CX - K.ch + 14, 420) + medal(CX + K.ch - 14, 420);
+    } },
+  { id: 'puffer', name: '面包羽绒服', c1: '#ffd36e', pat: 'none', pc: '#ffffff', tags: ['winter', 'street', 'cute', 'sporty'],
+    sleeve: { len: .95, ease: 10, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1);
+      const R = jacketPanel(K, { hem: 480, closeAt: 290, overlap: 0, vEnd: 290, ease: 12 });
+      let q = '';
+      for (const y of [336, 372, 408, 444]) q += `M${CX - 120},${y}Q${CX},${y + 6} ${CX + 120},${y}`;
+      const extra = ln(q, lc, 1.8, { opacity: .55 }) + ln(q.replace(/,(\d+)Q/g, (m, y) => `,${+y - 16}Q`), '#fff', 3, { opacity: .22 });
+      const collar = flat(`M${CX - K.neck - 14},300Q${CX},318 ${CX + K.neck + 14},300L${CX + K.neck + 16},272Q${CX},284 ${CX - K.neck - 16},272Z`, it.c1, lc, 2.4);
+      return panelsCast(env, R) + paint(ctx, smooth(mirAll(R)), it.c1, { extra, shade: 'lr' }) + paint(ctx, smooth(R), it.c1, { extra, shade: 'lr' }) + collar + ln(`M${CX},300V478`, lc, 1.8);
+    } },
+  { id: 'capelet', coversArms: true, name: '魔法披肩', c1: '#6f52c9', c2: '#ffd166', pat: 'star', pc: '#ffe9a8', tags: ['fantasy', 'elegant', 'winter', 'party'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const w = K.sh + 26;
+      const R = [[CX, 300], [CX + K.neck + 6, 292], [CX + K.sh, 310], [CX + w - 6, 350], [CX + w, 394, 1], [CX + w * .5, 398], [CX + 8, 392, 1], [CX, 380]];
+      const lc = lineOf(it.c1);
+      return paint(ctx, S(R), it.c1, { pat: it.patUrl, shade: 'tb' })
+        + ln(`M${CX - w + 2},392Q${CX - w * .5},400 ${CX - 8},390M${CX + w - 2},392Q${CX + w * .5},400 ${CX + 8},390`, it.c2, 2.4)
+        + circ(CX, 304, 7, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 2 }) + path(starD(CX, 304, 4.5, .45), { fill: '#fff' });
+    } },
+  { id: 'waxed', name: '油蜡猎装夹克', c1: '#4f5a3c', c2: '#6b4a2e', pat: 'none', pc: '#ffffff', tags: ['workwear', 'vintage', 'classic', 'autumn'],
+    sleeve: { len: .95, ease: 7, cuff: 'c2' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1), hem = 496;
+      const R = jacketPanel(K, { hem, closeAt: 300, overlap: 6, vEnd: 296, ease: 7.5 });
+      const folds = sideFolds(K, hem, .8);
+      // waxed cotton is a little shiny: a couple of soft streaks on the lit (left) side
+      const sheen = ln(`M${CX - K.ch - 2},360Q${CX - K.ch + 4},392 ${CX - K.ch},430M${CX - 30},440Q${CX - 26},462 ${CX - 30},484`, '#fff', 2.4, { opacity: .16 });
+      const body = panelsCast(env, R) + paint(ctx, smooth(mirAll(R)), it.c1, { extra: folds }) + paint(ctx, smooth(R), it.c1, { extra: folds });
+      const placket = flat(`M${CX - 6},300L${CX + 8},300L${CX + 8},${hem}L${CX - 6},${hem}Z`, it.c1, lc, 2) + buttons([CX + 1], [330, 372, 414, 456], '#3a3226', 2.6);
+      // bellows pockets with flaps at the hips, hand-warmer slits above them
+      const pk = s => { const x = s < 0 ? CX - K.hi - 10 : CX + K.hi - 22; return pocket(x, 446, 32, 34, it.c1, { flap: true, flapFill: shadeOf(it.c1, .04) })
+        + ln(`M${CX + s * (K.wa - 2)},404L${CX + s * (K.wa + 6)},436`, lc, 1.8); };
+      return body + placket + pk(-1) + pk(1) + flatCollar(K, it.c2, { w: 28, depth: 322 }) + sheen;
+    } },
+  { id: 'harrington', name: '哈灵顿夹克', c1: '#d9c8a0', c2: '#b8233a', pat: 'none', pc: '#ffffff', tags: ['classic', 'preppy', 'vintage', 'casual'],
+    sleeve: { len: .95, ease: 6, cuff: 'rib' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1), hem = 466;
+      const R = jacketPanel(K, { hem, closeAt: 306, overlap: 0, vEnd: 304, ease: 6.5 });
+      const folds = sideFolds(K, hem, .8);
+      const hw = Math.max(K.hi, K.wa) + 7;
+      const band = flat(`M${CX - hw},452H${CX + hw}V467H${CX - hw}Z`, shadeOf(it.c1, .08), lc, 2.2) + ln(Array.from({ length: Math.round(hw * 2 / 5) }, (_, i) => `M${CX - hw + 3 + i * 5},454V465`).join(''), lc, 1, { opacity: .35 });
+      const body = panelsCast(env, R) + paint(ctx, smooth(mirAll(R)), it.c1, { extra: folds }) + paint(ctx, smooth(R), it.c1, { extra: folds });
+      const zip = ln(`M${CX},306V452`, '#c8b98a', 2) + ln(`M${CX},306V452`, '#6a5a3a', 1, { 'stroke-dasharray': '1.5 1.5' });
+      // stand-up funnel collar with two buttons, tartan lining showing at the neck
+      const w = K.neck + 6;
+      const collar = flat(`M${CX - w},276Q${CX},282 ${CX + w},276L${CX + w + 2},300Q${CX},310 ${CX - w - 2},300Z`, it.c1, lc, 2.4)
+        + path(`M${CX - w + 3},279Q${CX},284 ${CX + w - 3},279L${CX + w - 3},283Q${CX},288 ${CX - w + 3},283Z`, { fill: it.c2 }) + buttons([CX - 7, CX + 7], [292], '#3a3226', 2.2);
+      const pk = s => { const X = d => CX + s * d; return path(`M${X(16)},402L${X(K.wa + 4)},418L${X(K.wa + 3)},426L${X(15)},410Z`, shadowFill(.12, { transform: 'translate(1,2)' }))
+        + flat(`M${X(16)},400L${X(K.wa + 4)},416L${X(K.wa + 3)},424L${X(15)},408Z`, it.c1, lc, 1.8) + circ(X(K.wa / 2 + 10), 410, 1.8, { fill: '#3a3226' }); };
+      return body + band + zip + pk(-1) + pk(1) + collar;
+    } },
+  { id: 'peacoat', name: '海军双排扣呢大衣', c1: '#1f2a44', pat: 'none', pc: '#ffffff', tags: ['classic', 'winter', 'preppy', 'cool'],
+    sleeve: { len: .95, ease: 7 },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1), hem = 530;
+      const R = jacketPanel(K, { hem, closeAt: 330, overlap: 22, vEnd: 316, ease: 8, flare: 8 });
+      const folds = sideFolds(K, hem, .8);
+      const body = panelsCast(env, R) + paint(ctx, smooth(mirAll(R)), it.c1, { extra: folds }) + paint(ctx, smooth(R), it.c1, { extra: folds });
+      // big anchor buttons in two columns, vertical hand-warmer pockets
+      const btn = buttons([CX - 14, CX + 16], [356, 392, 428], '#2b2b33', 4.4);
+      const anchors = [356, 392, 428].map(y => [CX - 14, CX + 16].map(x => ln(`M${x},${y - 2}V${y + 2}M${x - 1.6},${y + 1}Q${x},${y + 3} ${x + 1.6},${y + 1}`, '#8a8f9e', .9)).join('')).join('');
+      const slit = s => { const X = d => CX + s * d; return path(`M${X(K.wa + 2)},420L${X(K.wa + 8)},468L${X(K.wa + 4)},468L${X(K.wa - 2)},420Z`, shadowFill(.12)) + ln(`M${X(K.wa + 2)},420L${X(K.wa + 8)},468`, lc, 2); };
+      return body + lapels(K, it.c1, { roll: 344, notch: 316, w: 48 }) + btn + anchors + slit(-1) + slit(1);
+    } },
+  { id: 'coach', name: '教练夹克', c1: '#2b2f3a', pat: 'none', pc: '#ffffff', tags: ['street', 'sporty', 'cool', 'casual'],
+    sleeve: { len: .95, ease: 7, cuff: 'band' },
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const lc = lineOf(it.c1), hem = 474;
+      const R = jacketPanel(K, { hem, closeAt: 300, overlap: 4, vEnd: 296, ease: 7.5 });
+      const folds = sideFolds(K, hem, .8);
+      const body = panelsCast(env, R) + paint(ctx, smooth(mirAll(R)), it.c1, { extra: folds }) + paint(ctx, smooth(R), it.c1, { extra: folds });
+      const snaps = buttons([CX + 1], [326, 360, 394, 428, 460], '#d8dce4', 2.4);
+      // drawcord hem with toggles, a small print on the chest
+      const hw = Math.max(K.hi, K.wa) + 8;
+      const cord = ln(`M${CX - hw + 4},466H${CX + hw - 4}`, lighten(it.c1, .25), 1.2, { opacity: .7 })
+        + ln(`M${CX - 30},468l-3,14M${CX + 30},468l3,14`, '#e8e8ee', 1.8) + circ(CX - 33, 483, 2.6, { fill: '#e8e8ee', stroke: lineOf('#e8e8ee'), 'stroke-width': 1 }) + circ(CX + 33, 483, 2.6, { fill: '#e8e8ee', stroke: lineOf('#e8e8ee'), 'stroke-width': 1 });
+      const print = circ(CX - K.ch + 14, 352, 7, { fill: 'none', stroke: '#e8e8ee', 'stroke-width': 2 }) + path(starD(CX - K.ch + 14, 352, 3.6, .45), { fill: '#e8e8ee' });
+      return body + snaps + cord + print + flatCollar(K, it.c1, { w: 26, depth: 322 });
+    } },
+);
+
+/* ---- wear_feet.js ---- */
+/* ===== wear_feet.js — socks & shoes =====
+   Front view, light from the upper left (same as the cel shadows on clothes): every shoe gets its shadow on the
+   right and its highlight on the upper left of the toe — the same side on both feet, never mirrored. */
+
+/* ---------- socks ---------- */
+/* scale an absolute path (as smooth() writes it) about a point; patterns stay in register with the leg */
+function scalePath(d, cx, cy, k) {
+  return d.replace(/(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/g, (m, x, y) => `${r1(cx + (x - cx) * k)},${r1(cy + (y - cy) * k)}`);
+}
+/* the foot of a sock is the paw itself, a little bigger, so the bare paw never peeks out around it */
+function sockFoot(K, sd) {
+  const f = toonFoot(K, sd), cx = CX + sd * (K.ac + 1);
+  return { d: scalePath(f.d, cx, 680, 1.05), toes: scalePath(f.toes, cx, 680, 1.05) };
+}
+/* x where the cel shadow on the right of a sock starts — one line shared by the leg part and the foot */
+function sockShadeX(K, sd, y0, y1, add) {
+  let lo = Infinity, hi = -Infinity;
+  for (let y = y0; y <= y1; y += 4) { const e = legEdgeAt(K, y, add); for (const x of [CX + sd * e.i, CX + sd * e.o]) { lo = Math.min(lo, x); hi = Math.max(hi, x); } }
+  return lo + (hi - lo) * .74;
+}
+const isShod = st => !!(st.wear && st.wear.shoes);
+function sockShape(env, it, y0, o = {}) {
+  const { K, ctx, st } = env;
+  const shod = isShod(st), col = it.c1, lc = lineOf(col), add = o.add ?? 1.4, ribH = o.ribH || 9;
+  let s = '';
+  for (const sd of [-1, 1]) {
+    const X = dx => CX + sd * dx;
+    const y1 = shod ? 680 : 672;
+    const bd = legBand(K, sd, y0, y1, add), sid = ctx.shape(bd);
+    const F = shod ? null : sockFoot(K, sd), fid = F ? ctx.shape(F.d) : null;
+    const xs = r1(sockShadeX(K, sd, y0, y1, add));
+    let ex = '';
+    if (o.rib !== false) ex += path(`M${CX - 120},${y0}H${CX + 120}V${y0 + ribH}H${CX - 120}Z`, { fill: shadeOf(col, .08) }) + ln(Array.from({ length: 50 }, (_, i) => `M${CX - 120 + i * 5},${y0 + 1}v${ribH - 2}`).join(''), lc, .8, { opacity: .4 });
+    if (o.stripes) for (const [dy, c] of o.stripes) ex += path(`M${CX - 120},${y0 + dy}H${CX + 120}V${y0 + dy + 4}H${CX - 120}Z`, { fill: c });
+    if (o.inner) ex += o.inner(sd);
+    ex += path(`M${xs},${y0 - 4}H${r1(xs + 90)}V720H${xs}Z`, shadowFill(.12));
+    const fill = id => use(id, { fill: col }) + (it.patUrl ? use(id, { fill: it.patUrl }) : '');
+    if (F) {
+      // over a bare paw the sock is one silhouette: both outlines under both fills, the cuff part in front of the foot
+      const e0 = legEdgeAt(K, y0, add);
+      s += use(sid, { fill: 'none', stroke: lc, 'stroke-width': 4.4, 'stroke-linejoin': 'round' }) + use(fid, { fill: 'none', stroke: lc, 'stroke-width': 4.4, 'stroke-linejoin': 'round' })
+        + g(fill(fid) + fill(sid) + ex, { 'clip-path': ctx.clipAll([bd, F.d]) })
+        + ln(F.toes, lc, 1.5, { opacity: .45 }) + ln(`M${X(e0.i - 1)},${y0 - 1.1}L${X(e0.o + 1)},${y0 - 1.1}`, lc, 2.2);
+    } else {
+      s += g(fill(sid) + ex, { 'clip-path': ctx.clipUse(sid) }) + use(sid, { fill: 'none', stroke: lc, 'stroke-width': 2.2, 'stroke-linejoin': 'round' });
+    }
+  }
+  return s;
+}
+ITEMS.socks.push(
+  { id: 'ankle', name: '短袜', c1: '#ffffff', pat: 'none', pc: '#ff8fab', tags: ['casual', 'sporty', 'cute', 'summer'], draw: (env, it) => sockShape(env, it, 640, { ribH: 7 }) },
+  { id: 'crew', name: '中筒袜', c1: '#f4efe6', pat: 'none', pc: '#ffffff', tags: ['casual', 'preppy', 'workwear'], draw: (env, it) => sockShape(env, it, 616) },
+  { id: 'argyle', name: '菱格袜', c1: '#2f3d66', pat: 'argyle', pc: '#c9374b', tags: ['preppy', 'classic', 'vintage'], draw: (env, it) => sockShape(env, it, 610) },
+  { id: 'tube', name: '运动长筒袜', c1: '#ffffff', c2: '#c9374b', pat: 'none', pc: '#ffffff', tags: ['sporty', 'vintage', 'street'],
+    draw: (env, it) => sockShape(env, it, 566, { ribH: 26, stripes: [[6, it.c2], [14, '#23396b']] }) },
+  { id: 'knee', name: '及膝袜', c1: '#2b2733', pat: 'none', pc: '#ffffff', tags: ['preppy', 'cute', 'sweet', 'classic'], draw: (env, it) => sockShape(env, it, 566) },
+  { id: 'thigh', name: '过膝袜', c1: '#f7f2fb', pat: 'none', pc: '#ff8fab', tags: ['cute', 'sweet', 'fantasy'],
+    draw: (env, it) => {
+      const s = sockShape(env, it, 512, { ribH: 7 });
+      const bow = sd => { const x = CX + sd * (env.K.kc + 8); return flat(smooth([[x, 516], [x - 9, 510], [x - 10, 521, 1], [x - 2, 518], [x + 2, 518], [x + 10, 521, 1], [x + 9, 510]]), '#ff7a9c', lineOf('#ff7a9c'), 1.6); };
+      return s + bow(-1) + bow(1);
+    } },
+  { id: 'tights', name: '连裤袜', c1: '#2b2733', pat: 'none', pc: '#ffffff', tags: ['elegant', 'classic', 'winter', 'office'],
+    draw: (env, it) => {
+      const { K } = env;
+      let s = '';
+      const shod = isShod(env.st), lc = lineOf(it.c1);
+      for (const sd of [-1, 1]) {
+        // leg and foot are painted opaque and then made sheer together, so their overlap doesn't double up
+        const parts = [legPath(K, sd, { top: .6, thigh: .6, knee: .6, calf: .6, ankle: .6 }, shod ? 684 : 676)];
+        if (!shod) parts.push(sockFoot(K, sd).d);
+        s += g(parts.map(d => path(d, { fill: 'none', stroke: lc, 'stroke-width': 4.4, 'stroke-linejoin': 'round' })).join('') + parts.map(d => path(d, { fill: it.c1 })).join(''), { opacity: .86 });
+      }
+      // sheer sheen down the shin, on the lit (left) side of each leg
+      for (const sd of [-1, 1]) { const e = legEdgeAt(K, 590); const x = CX + sd * (sd < 0 ? e.o - 5 : e.i + 5); s += ln(`M${x},540Q${x - 1},590 ${x + sd * 2},650`, '#fff', 2.6, { opacity: .16 }); }
+      return s;
+    } },
+  { id: 'loose', name: '泡泡袜', c1: '#ffffff', pat: 'none', pc: '#ffd1dc', tags: ['cute', 'street', 'vintage'],
+    draw: (env, it) => {
+      const { K } = env;
+      // slouched folds wrap round the leg: drawn inside the sock and cut off by its outline
+      const folds = sd => { const e = legEdgeAt(K, 620), x0 = CX + sd * (e.i - 6), x1 = CX + sd * (e.o + 8), m = (x0 + x1) / 2;
+        return ln(`M${x0},614Q${m},607 ${x1},615M${x0},629Q${m},622 ${x1},631M${x0},645Q${m},638 ${x1},646`, lineOf(it.c1), 1.6, { opacity: .55 }); };
+      return sockShape(env, it, 604, { add: 4, rib: false, inner: folds });
+    } },
+);
+
+/* ---------- shoes ---------- */
+/* Frame of one shoe: centred on the paw, wide enough to hold it, but always leaving a gap between the two shoes.
+   o(d): x of an offset d from the centre line on this side (mirrors with the foot) — for construction lines.
+   L(u): screen x relative to the shoe centre (does NOT mirror) — for light: highlights and shadows. */
+function shoeFrame(K, sd) {
+  const a = K.ac, c = a + 1;
+  const hw = Math.min(c - 2, K.aw + 13);
+  const cx = CX + sd * c;
+  return { sd, K, a, c, hw, aw: K.aw, cx, o: d => CX + sd * d, L: u => cx + u };
+}
+/* upper outline: the opening at `top`, down the inner side, round the domed toe, up the outer side.
+   Boots follow the leg up to the shaft top (flare: how far the shaft stands off the leg; straight: no pinch at the ankle).
+   dip: how far the throat (opening) dips in the middle. */
+function upperD(F, o) {
+  const { K, a, c, hw, aw } = F, X = F.o;
+  const top = o.top, pointy = o.pointy;
+  let inT, outT;
+  if (top < 656) { const e = legEdgeAt(K, top), fl = o.flare ?? 2.5; inT = e.i - fl; outT = e.o + fl; }
+  else { inT = a - aw - (o.ankle ?? 2.5); outT = a + aw + (o.ankle ?? 2.5); }
+  const w = pointy ? hw - 2.5 : hw;
+  const pts = [[X(inT), top, 1]];
+  if (top < 656) pts.push([X(o.straight ? inT : a - aw - 2.5), 664]);
+  pts.push([X(c - w + 3), 680], [X(c - w), 692], [X(c - w + 1.5), 701], [X(c - w + 4.5), 706, pointy ? 0 : 1]);
+  if (pointy) pts.push([X(c + 1.5), 712, 1]);
+  pts.push([X(c + w - 4.5), 706, pointy ? 0 : 1], [X(c + w - 1), 701], [X(c + w + .5), 692], [X(c + w - 2.5), 680]);
+  if (top < 656) pts.push([X(o.straight ? outT : a + aw + 2.5), 664]);
+  pts.push([X(outT), top, 1]);
+  if (o.dip) { const m = (inT + outT) / 2; pts.push([X(lerp(m, outT, .55)), top + o.dip * .72], [X(m), top + o.dip], [X(lerp(m, inT, .55)), top + o.dip * .72]); }
+  return { d: smooth(pts), inT, outT, top };
+}
+/* sole: a band under the upper, a little wider, with a darker underside */
+function soleD(F, h, wide = .5) {
+  const X = F.o, c = F.c, hw = F.hw + wide, y0 = 711 - h;
+  return `M${X(c - hw)},${y0}L${X(c + hw)},${y0}Q${X(c + hw + 1)},${r1(y0 + h * .5)} ${X(c + hw - 1.2)},711L${X(c - hw + 1.2)},711Q${X(c - hw - 1)},${r1(y0 + h * .5)} ${X(c - hw)},${y0}Z`;
+}
+/* light: cel shadow on the right of the shoe + a darker band just above the sole */
+function shoeShade(F) {
+  const x = F.L(F.hw * .3);
+  return path(`M${x},600L${F.cx + 60},600L${F.cx + 60},720L${x + 4},720Z`, shadowFill(.16))
+    + path(`M${F.cx - 60},701H${F.cx + 60}V720H${F.cx - 60}Z`, shadowFill(.1));
+}
+/* specular highlight, drawn like the reference: one small horizontal lens on the toe dome, left of centre on BOTH
+   shoes (light from the upper left, never mirrored). patent: almost white with a tiny glint beside it; polished: a
+   pale tint of the leather; leather: a lighter shade of it; satin: a wide, faint sheen; canvas and cloth: none. */
+function shoeShine(F, kind, col, y = 691) {
+  const x = F.L(-F.hw * .36), w = F.hw * .28;
+  const lens = (cx, cy, hw, hh) => `M${r1(cx - hw)},${r1(cy + hh * .25)}Q${r1(cx - hw * .2)},${r1(cy - hh * 1.25)} ${r1(cx + hw)},${r1(cy - hh * .35)}Q${r1(cx + hw * .1)},${r1(cy + hh * 1.15)} ${r1(cx - hw)},${r1(cy + hh * .25)}Z`;
+  switch (kind) {
+    case 'patent': { const c = mix(col, '#ffffff', .8); return path(lens(x, y, w, 3.2), { fill: c }) + circ(r1(x + w + 3.2), r1(y - .7), 1.1, { fill: c, opacity: .85 }); }
+    case 'polished': return path(lens(x, y, w * 1.05, 3.2), { fill: mix(col, '#ffffff', .72) });
+    case 'leather': return path(lens(x, y, w * .95, 3), { fill: lighten(col, .3), opacity: .9 });
+    case 'satin': return path(lens(x + 1, y, w * 1.35, 3.2), { fill: '#ffffff', opacity: .3 });
+    default: return '';
+  }
+}
+/* lace-up front: tongue, eyelets and an X lacing between y0 (top) and y1 */
+function lacing(F, y0, y1, rows, laceCol, o = {}) {
+  const ew = o.ew ?? 6.5, cx = F.cx;
+  const gap = (y1 - y0) / rows;
+  let tongue = o.tongue ? flat(`M${cx - ew - 3},${y0 - 6}Q${cx},${y0 - 10} ${cx + ew + 3},${y0 - 6}L${cx + ew + 2},${y1}L${cx - ew - 2},${y1}Z`, o.tongue, lineOf(o.tongue), 1.8) : '';
+  let lace = '', eye = '';
+  for (let k = 0; k < rows; k++) {
+    const y = y0 + k * gap;
+    lace += `M${cx - ew},${r1(y)}L${cx + ew},${r1(y + gap)}M${cx + ew},${r1(y)}L${cx - ew},${r1(y + gap)}`;
+    eye += circ(cx - ew, r1(y), 1.7, { fill: o.eyelet || '#d9d2c4', stroke: '#3b2a24', 'stroke-width': .9 }) + circ(cx + ew, r1(y), 1.7, { fill: o.eyelet || '#d9d2c4', stroke: '#3b2a24', 'stroke-width': .9 });
+  }
+  const w = o.w ?? 2.6;
+  return tongue + ln(lace, lineOf(laceCol), w + 1.8) + ln(lace, laceCol, w) + eye;
+}
+/* one pair: floor shadows first, then each shoe (drawn by fn), clipped detail stays inside its upper */
+function shoePair(env, it, fn) {
+  const { K } = env;
+  let s = '';
+  for (const sd of [-1, 1]) { const F = shoeFrame(K, sd); s += ell(F.cx, 711.5, F.hw + 3, 3.2, { fill: '#3b1a1f', opacity: .16 }); }
+  for (const sd of [-1, 1]) s += fn(shoeFrame(K, sd));
+  return s;
+}
+/* upper with pattern, inner details, light and outline */
+function upperPaint(ctx, U, col, o = {}) {
+  const sid = ctx.shape(U.d);
+  let s = use(sid, { fill: col });
+  if (o.pat) s += use(sid, { fill: o.pat });
+  s = g(s + (o.extra || '') + (o.shade === false ? '' : shoeShade(o.F)), { 'clip-path': ctx.clipUse(sid) });
+  s += use(sid, { fill: 'none', stroke: o.line || lineOf(col), 'stroke-width': 2.5, 'stroke-linejoin': 'round' });
+  return s + (o.over || '');
+}
+/* what shows inside a low-cut shoe's opening: the sock if one is worn, otherwise the paw */
+function instep(env, F, U, depth = 9) {
+  const { st, K } = env;
+  const sk = st.wear && st.wear.socks ? itemOf('socks', st.wear.socks) : null;
+  const col = sk ? sk.c1 : furColors(st).foot;
+  const X = F.o, m = (U.inT + U.outT) / 2;
+  const d = `M${X(U.inT + 1)},${U.top - 2}Q${X(m)},${U.top - 6} ${X(U.outT - 1)},${U.top - 2}L${X(U.outT - 3)},${U.top + depth + 6}Q${X(m)},${U.top + depth + 10} ${X(U.inT + 3)},${U.top + depth + 6}Z`;
+  return path(d, { fill: col }) + path(d, shadowFill(.22));
+}
+
+ITEMS.shoes.push(
+  { id: 'maryjane', name: '玛丽珍鞋', c1: '#231e26', pat: 'none', pc: '#ffffff', tags: ['cute', 'preppy', 'sweet', 'classic'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx } = env, X = F.o;
+      const U = upperD(F, { top: 667, dip: 9 });
+      const lc = lineOf(it.c1);
+      // strap crosses the instep above the dipped throat (sock shows between them); buckle on its outer end, on the shoe
+      const sIn = U.inT - .5, sOut = U.outT + .5, m = (sIn + sOut) / 2, sy = U.top - 1.5;
+      const strap = `M${X(sIn)},${sy}Q${X(m)},${sy - 4} ${X(sOut)},${sy}L${X(sOut)},${sy + 5.5}Q${X(m)},${sy + 1.5} ${X(sIn)},${sy + 5.5}Z`;
+      const bx = X(sOut - 4.5), metal = '#dfe3ea';
+      const buckle = path(`M${bx - 3.4},${sy - 1.6}h6.8v8.6h-6.8z`, { fill: 'none', stroke: '#4a4650', 'stroke-width': 3.2 }) + path(`M${bx - 3.4},${sy - 1.6}h6.8v8.6h-6.8z`, { fill: 'none', stroke: metal, 'stroke-width': 1.7 }) + ln(`M${bx},${sy}v5.4`, metal, 1.3);
+      return instep(env, F, U, 9) + flat(soleD(F, 5), darken(it.c1, .35), lc, 2) + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: shoeShine(F, 'patent', it.c1) })
+        + flat(strap, it.c1, lc, 2) + ln(`M${r1(Math.min(X(sIn), X(sOut)) + 3)},${sy + 1.5}Q${r1(Math.min(X(sIn), X(sOut)) + 7)},${sy - 1.2} ${X(m)},${sy - 1.8}`, mix(it.c1, '#ffffff', .82), 1.3, { opacity: .55 }) + buckle;
+    }) },
+  { id: 'canvas', name: '高帮帆布鞋', c1: '#2a252c', c2: '#fbf5ea', pat: 'none', pc: '#ffffff', tags: ['street', 'casual', 'vintage', 'sporty'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx } = env, X = F.o, c = F.c, hw = F.hw;
+      const U = upperD(F, { top: 630, flare: 3, straight: true });
+      const lc = lineOf(it.c1), rub = it.c2, rl = lineOf(rub);
+      // rubber toe cap (a half dome) and the tall rubber foxing band with a thin pin stripe
+      const cap = smooth([[X(c - hw + 1), 706, 1], [X(c - hw + 2), 696], [X(c - hw * .55), 687], [X(c), 684.5], [X(c + hw * .55), 687], [X(c + hw - 1.5), 696], [X(c + hw), 706, 1]]);
+      const collar = ln(`M${X(U.inT + 1)},${U.top + 4}Q${X((U.inT + U.outT) / 2)},${U.top + 1} ${X(U.outT - 1)},${U.top + 4}`, lc, 1.4, { opacity: .6 });
+      const seam = stitch(`M${X(c - hw + 3)},683Q${X(c)},676 ${X(c + hw - 3)},683`, lighten(it.c1, .35), 1);
+      return flat(soleD(F, 9), rub, rl, 2.2) + ln(`M${X(c - hw - .5)},706.2H${X(c + hw + .5)}`, '#2a2530', 1.3, { opacity: .7 })
+        + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: seam + collar })
+        + flat(cap, rub, rl, 2.2) + ln(`M${X(c - hw * .7)},702Q${X(c)},698 ${X(c + hw * .7)},702`, rl, 1, { opacity: .35 })
+        + lacing(F, U.top + 7, 682, 4, '#fbf5ea', { tongue: shadeOf(it.c1, .08), eyelet: '#d9d2c4' });
+    }) },
+  { id: 'loafer', name: '便士乐福鞋', c1: '#7c2027', pat: 'none', pc: '#ffffff', tags: ['preppy', 'classic', 'office', 'vintage'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx } = env, X = F.o, c = F.c, hw = F.hw;
+      const U = upperD(F, { top: 662, dip: 5 });
+      const lc = lineOf(it.c1);
+      // moccasin apron: raised U seam over the toe, with stitching
+      const apron = `M${X(c - hw + 5)},676Q${X(c - hw + 4)},694 ${X(c)},695Q${X(c + hw - 4)},694 ${X(c + hw - 5)},676`;
+      // penny strap across the vamp with its diamond slot
+      const strap = `M${X(c - hw + 3)},676Q${X(c)},671 ${X(c + hw - 3)},676L${X(c + hw - 3.5)},683Q${X(c)},678 ${X(c - hw + 3.5)},683Z`;
+      const slot = `M${X(c) - 4.5},678.6L${X(c)},676.2L${X(c) + 4.5},678.6L${X(c)},681Z`;
+      return instep(env, F, U, 5) + flat(soleD(F, 6), '#3a1a1a', lineOf('#3a1a1a'), 2) + ln(`M${X(c - hw)},706.4H${X(c + hw)}`, '#c89a7a', 1, { opacity: .7 })
+        + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: ln(apron, lc, 1.8) + stitch(apron.replace(/,(6\d\d)/g, (m, y) => ',' + (+y - 2.5)), lighten(it.c1, .38), 1) + shoeShine(F, 'polished', it.c1, 692) })
+        + flat(strap, shadeOf(it.c1, .06), lc, 1.8) + path(slot, { fill: '#2a0e10' }) + ln(`M${r1(F.L(-hw + 6))},675.5Q${r1(F.L(-hw * .6))},672.6 ${r1(F.L(-hw * .2))},672.6`, mix(it.c1, '#ffffff', .6), 1.2, { opacity: .8 });
+    }) },
+  { id: 'mocboot', name: '复古工装靴', c1: '#c8863c', c2: '#f4e6c8', pat: 'none', pc: '#ffffff', tags: ['workwear', 'vintage', 'street', 'autumn'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx } = env, X = F.o, c = F.c, hw = F.hw;
+      const U = upperD(F, { top: 624, flare: 5, straight: true });
+      const lc = lineOf(it.c1), dk = darken(it.c1, .3);
+      // moc toe: U seam + stitch, a padded collar line, and the heel counter showing behind the shaft
+      const moc = `M${X(c - hw + 6)},694Q${X(c - hw + 5)},681 ${X(c)},680Q${X(c + hw - 5)},681 ${X(c + hw - 6)},694`;
+      const collar = ln(`M${X(U.inT + 1)},${U.top + 5}Q${X((U.inT + U.outT) / 2)},${U.top + 2} ${X(U.outT - 1)},${U.top + 5}`, dk, 1.6, { opacity: .7 });
+      return flat(soleD(F, 9), it.c2, lineOf(it.c2), 2.2) + ln(`M${X(c - hw - .5)},706.5H${X(c + hw + .5)}`, lineOf(it.c2), 1.1, { opacity: .5 })
+        + ln(`M${X(c - hw + 2)},709H${X(c + hw - 2)}`, darken(it.c2, .25), 1, { 'stroke-dasharray': '2 2.4' })
+        + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: ln(moc, dk, 1.7) + stitch(moc.replace(/,(6\d\d)/g, (m, y) => ',' + (+y + 2.6)), dk, 1) + collar + shoeShine(F, 'leather', it.c1, 696) })
+        + lacing(F, U.top + 8, 676, 4, '#fbf3e2', { tongue: mix(it.c1, '#4a2e1c', .3), eyelet: '#b8892f' });
+    }) },
+  { id: 'brogue', name: '布洛克牛津鞋', c1: '#8a5230', pat: 'none', pc: '#ffffff', tags: ['classic', 'office', 'preppy', 'vintage'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx } = env, X = F.o, c = F.c, hw = F.hw;
+      const U = upperD(F, { top: 662 });
+      const lc = lineOf(it.c1), pin = lighten(it.c1, .45);
+      // wingtip: the W seam with a row of punched holes, and a medallion on the toe cap
+      const wing = `M${X(c - hw + 1.5)},698Q${X(c - hw * .45)},683 ${X(c)},690Q${X(c + hw * .45)},683 ${X(c + hw - 1.5)},698`;
+      const dots = path(wing, { fill: 'none', stroke: pin, 'stroke-width': 1.5, 'stroke-dasharray': '.1 3', 'stroke-linecap': 'round', transform: 'translate(0,-3)' });
+      let med = '';
+      for (const [dx, dy] of [[0, 0], [-3, 2], [3, 2], [0, 4], [-1.6, 6], [1.6, 6]]) med += circ(X(c) + dx, 693 + dy, .9, { fill: pin });
+      // closed lacing: three short bars between the facings
+      const facing = `M${X(c - 6)},667L${X(c - 5)},679M${X(c + 6)},667L${X(c + 5)},679`;
+      const bars = ln(`M${X(c - 5.5)},670H${X(c + 5.5)}M${X(c - 5.2)},674H${X(c + 5.2)}M${X(c - 5)},678H${X(c + 5)}`, '#2a1a14', 1.6);
+      return flat(soleD(F, 5), '#3a2420', lineOf('#3a2420'), 2) + stitch(`M${X(c - hw)},707.5H${X(c + hw)}`, '#a07858', .9)
+        + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: ln(wing, lc, 1.7) + dots + med + ln(facing, lc, 1.3) + shoeShine(F, 'leather', it.c1, 700) })
+        + bars;
+    }) },
+  { id: 'chelsea', name: '切尔西靴', c1: '#3e2c26', pat: 'none', pc: '#ffffff', tags: ['classic', 'cool', 'street', 'winter'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx, K } = env, X = F.o, c = F.c;
+      const U = upperD(F, { top: 622, flare: 3.5 });
+      const lc = lineOf(it.c1);
+      // elastic gussets on both sides of the shaft (darker, ribbed) and a pull tab at the top
+      const gus = s2 => {
+        const e = legEdgeAt(K, 626), xa = s2 > 0 ? e.o + 2.5 : e.i - 2.5, xb = s2 > 0 ? K.ac + K.aw - 2 : K.ac - K.aw + 2;
+        const d = `M${X(xa)},622L${X(xa - s2 * 8)},622Q${X(xb - s2 * 2)},652 ${X(xb)},668Q${X(xa)},650 ${X(xa)},622Z`;
+        let rib = ''; for (let k = 1; k < 5; k++) rib += `M${X(xa - s2 * 2 * k)},624Q${X(lerp(xa, xb, .5) - s2 * 2 * k)},648 ${X(xb - s2 * (k * .6))},664`;
+        return path(d, { fill: darken(it.c1, .38) }) + ln(rib, darken(it.c1, .55), .9, { opacity: .8 });
+      };
+      const tab = flat(`M${X(c - 4)},612h8v12h-8z`, shadeOf(it.c1, .08), lc, 1.4);
+      return flat(soleD(F, 6), '#1f1612', lineOf('#1f1612'), 2) + tab
+        + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: gus(-1) + gus(1) + shoeShine(F, 'leather', it.c1, 694) });
+    }) },
+  { id: 'heels', name: '尖头高跟鞋', c1: '#e8456b', pat: 'none', pc: '#ffffff', tags: ['elegant', 'party', 'office'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx } = env, X = F.o, c = F.c, hw = F.hw;
+      const U = upperD(F, { top: 674, dip: 9, pointy: true, ankle: 1.5 });
+      const lc = lineOf(it.c1);
+      // slim heel showing behind the outer side, a lining edge along the low-cut throat
+      const heel = flat(`M${X(c + hw - 5)},686L${X(c + hw - 1)},686L${X(c + hw - 2.5)},711L${X(c + hw - 4.5)},711Z`, darken(it.c1, .25), lc, 1.6);
+      return heel + instep(env, F, U, 9) + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: shoeShine(F, 'patent', it.c1, 693) })
+        + ln(`M${X(U.inT + 2)},${U.top + 1.5}Q${X((U.inT + U.outT) / 2)},${U.top + 11} ${X(U.outT - 2)},${U.top + 1.5}`, lighten(it.c1, .3), 1.1, { opacity: .7 });
+    }) },
+  { id: 'sneaker', name: '老爹运动鞋', c1: '#fbfbfd', c2: '#7ec4ff', pat: 'none', pc: '#ffffff', tags: ['sporty', 'street', 'casual'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx } = env, X = F.o, c = F.c, hw = F.hw;
+      const U = upperD(F, { top: 660, ankle: 3.5 });
+      const lc = lineOf(it.c1), ac = it.c2;
+      // overlay panels: toe bumper and a side panel in the accent colour, mesh tongue, chunky wavy midsole
+      const panel = `M${X(c - hw + 1)},700Q${X(c - hw + 3)},686 ${X(c - hw * .35)},684Q${X(c - hw * .1)},694 ${X(c + hw * .2)},696Q${X(c + hw * .7)},690 ${X(c + hw - .5)},698L${X(c + hw)},706L${X(c - hw)},706Z`;
+      const mid = soleD(F, 11, 1);
+      const wave = `M${X(c - hw)},705Q${X(c - hw * .5)},702 ${X(c)},705Q${X(c + hw * .5)},708 ${X(c + hw)},704`;
+      return flat(mid, '#ffffff', '#9a93b0', 2.2) + ln(wave, ac, 2.2) + ln(`M${X(c - hw + 1)},709.5H${X(c + hw - 1)}`, '#9a93b0', 1, { opacity: .5 })
+        + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: path(panel, { fill: lighten(ac, .25), stroke: lineOf(ac), 'stroke-width': 1.4 }) })
+        + lacing(F, U.top + 5, 682, 3, '#f2f0f8', { tongue: '#e8e6f0', eyelet: '#ffffff', w: 2.2 });
+    }) },
+  { id: 'ballet', name: '芭蕾绑带鞋', c1: '#ffc2d4', pat: 'none', pc: '#ffffff', tags: ['sweet', 'elegant', 'cute', 'fantasy'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      // ribbons criss-cross up each ankle (drawn under the shoes)
+      let rib = '';
+      for (const sd of [-1, 1]) {
+        const X = d => CX + sd * d;
+        for (let y = 600; y < 664; y += 16) { const a = legEdgeAt(K, y), b = legEdgeAt(K, y + 16); rib += `M${X(a.i - 1)},${y}L${X(b.o + 1)},${y + 16}M${X(a.o + 1)},${y}L${X(b.i - 1)},${y + 16}`; }
+      }
+      return ln(rib, darken(it.c1, .15), 3.4) + ln(rib, it.c1, 2) + shoePair(env, it, F => {
+        const X = F.o, c = F.c;
+        const U = upperD(F, { top: 674, dip: 8, ankle: 1.5 });
+        const bow = flat(smooth([[X(c), 681], [X(c - 6), 677], [X(c - 7), 685, 1], [X(c - 1), 683], [X(c + 1), 683], [X(c + 7), 685, 1], [X(c + 6), 677]]), shadeOf(it.c1, .1), lineOf(it.c1), 1.4);
+        return instep(env, F, U, 8) + flat(soleD(F, 4, .5), shadeOf(it.c1, .25), lineOf(it.c1), 1.8)
+          + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: shoeShine(F, 'satin', it.c1, 692) }) + bow;
+      });
+    } },
+  { id: 'embroidered', name: '绣花布鞋', c1: '#2b2530', c2: '#ff6f91', pat: 'none', pc: '#ffffff', tags: ['chinese', 'vintage', 'cute'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx } = env, X = F.o, c = F.c, hw = F.hw;
+      const U = upperD(F, { top: 667, dip: 6 });
+      const fx = X(c), fy = 692;
+      let fl = '';
+      for (let k = 0; k < 5; k++) { const a = k * 1.2566 - 1.57; fl += circ(r1(fx + Math.cos(a) * 3.4), r1(fy + Math.sin(a) * 3.4), 2.4, { fill: it.c2 }); }
+      fl += circ(fx, fy, 1.6, { fill: '#ffe066' }) + ln(`M${fx - 9},${fy + 2}q-4,-4 -8,-2M${fx + 9},${fy + 2}q4,-4 8,-2`, '#7cc37a', 1.6);
+      // layered white cloth sole with stitch rows
+      const sl = soleD(F, 7);
+      return instep(env, F, U, 6) + flat(sl, '#f6f1e6', '#8a8070', 2) + ln(`M${X(c - hw)},707.3H${X(c + hw)}`, '#c8bea8', 1) + stitch(`M${X(c - hw + 2)},709.4H${X(c + hw - 2)}`, '#a89c84', .8)
+        + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: ln(`M${X(U.inT + 1)},${U.top + 2}Q${X((U.inT + U.outT) / 2)},${U.top + 8} ${X(U.outT - 1)},${U.top + 2}`, lighten(it.c1, .3), 1.6, { opacity: .8 }) + fl });
+    }) },
+  { id: 'boat', name: '复古船鞋', c1: '#9c6a3c', pat: 'none', pc: '#ffffff', tags: ['preppy', 'summer', 'casual', 'vintage'],
+    draw: (env, it) => shoePair(env, it, F => {
+      const { ctx } = env, X = F.o, c = F.c, hw = F.hw;
+      const U = upperD(F, { top: 663, dip: 3 });
+      const lc = lineOf(it.c1), raw = '#e8d2a8';
+      // moc vamp stitch, a rawhide lace running round the collar and tied on the outer side, white sole with siping
+      const vamp = `M${X(c - hw + 5)},680Q${X(c - hw + 4)},696 ${X(c)},697Q${X(c + hw - 4)},696 ${X(c + hw - 5)},680`;
+      const lace = `M${X(U.inT + 1)},${U.top + 3}Q${X((U.inT + U.outT) / 2)},${U.top + 6} ${X(U.outT - 1)},${U.top + 3}`;
+      const tie = ln(`M${X(U.outT - 1)},${U.top + 3}l${F.sd * 5},7M${X(U.outT - 1)},${U.top + 3}l${F.sd * 1.5},9`, raw, 1.8) + circ(X(U.outT - 1), U.top + 3, 1.8, { fill: raw, stroke: '#7a5a3a', 'stroke-width': .8 });
+      return instep(env, F, U, 3) + flat(soleD(F, 6), '#f6f1e6', '#8a8070', 2) + ln(`M${X(c - hw + 1)},708.6H${X(c + hw - 1)}`, '#3a2a20', 1, { opacity: .8 })
+        + upperPaint(ctx, U, it.c1, { pat: it.patUrl, F, extra: ln(vamp, lc, 1.6) + stitch(vamp.replace(/,(6\d\d)/g, (m, y) => ',' + (+y - 2.4)), raw, 1.1) + shoeShine(F, 'leather', it.c1, 692) })
+        + ln(lace, raw, 2) + tie;
+    }) },
+);
+
+/* ---- wear_head.js ---- */
+/* ===== wear_head.js — hats, glasses, face stickers ===== */
+const hp = (env, it, d, o = {}) => paint(env.ctx, d, o.col || it.c1, { pat: o.noPat ? null : it.patUrl, shade: o.shade || 'rad', extra: o.extra, sw: o.sw ?? 2.6 });
+
+/* ---------- fitting hats to the head ----------
+   Every species has its own cranium (TOON_HEADS), so hats are built from that outline instead of fixed numbers.
+   Light comes from the upper left like everywhere else: cel shadow on the right and under edges, a lighter tone
+   (never white) on matte tops, white specular only on shiny bits such as a metal buckle. */
+function hatFit(st) {
+  const kind = headKindOf(st);
+  return { kind, T: TOON_HEADS[kind].right[0][1] - .8, W: y => craniumX(kind, y) - 200, arc: (y0, t) => craniumArc(kind, y0, t), headD: toonHeadPath(kind, '_hat', []) };
+}
+/* closed shape from an arc (left end -> right end) and the points of its lower edge (right -> left) */
+const arcShape = (arc, lower = []) => smooth([[...arc[0], 1], ...arc.slice(1, -1), [...arc[arc.length - 1], 1], ...lower]);
+/* meridian (a seam or knit rib) over a dome: the right half of its arc squeezed towards the centre line */
+function meridian(arc, u) {
+  const half = arc.slice((arc.length - 1) / 2);
+  return smooth(half.map(([x, y]) => [r1(200 + (x - 200) * u), y]), false);
+}
+const hatShade = celShade, hatLit = celLit;
+/* one hat part: fill (+ pattern), details and light clipped inside, then the ink line */
+function hatPart(ctx, d, col, o = {}) {
+  const sid = ctx.shape(d);
+  let s = use(sid, { fill: col });
+  if (o.pat) s += use(sid, { fill: o.pat });
+  let inner = o.extra || '';
+  if (o.lit) inner += hatLit(ctx, d, ...o.lit);
+  if (o.shade !== false) inner += hatShade(ctx, d, ...(o.shade || []));
+  if (o.after) inner += o.after;
+  if (inner) s = g(s + inner, { 'clip-path': ctx.clipUse(sid) });
+  return s + use(sid, { fill: 'none', stroke: o.line || lineOf(col), 'stroke-width': o.sw ?? 2.6, 'stroke-linejoin': 'round' });
+}
+/* soft shadow the hat casts on the face, just under its front edge (edge points left -> right), kept inside the head */
+function browShadow(ctx, H, edge, depth = 7, op = .13) {
+  const lo = edge.slice().reverse().map(([x, y]) => [x + 2, y + depth]);
+  const d = smooth([[...edge[0], 1], ...edge.slice(1, -1), [...edge[edge.length - 1], 1], [...lo[0], 1], ...lo.slice(1, -1), [...lo[lo.length - 1], 1]]);
+  return path(d, shadowFill(op, { 'clip-path': ctx.clip(H.headD) }));
+}
+/* an edge that bows by `bow` at the centre between x0 and x1 (bow < 0: the centre is higher) */
+const bowEdge = (x0, x1, y, bow, n = 6) => Array.from({ length: n + 1 }, (_, i) => { const u = i / n, x = lerp(x0, x1, u), v = (u - .5) * 2; return [r1(x), r1(y + bow * (1 - v * v))]; });
+/* flat brim seen slightly from above: back edge, rounded ends, front edge dipping by `dip` */
+function brimPts(cx, y, w, back, front, endDrop = 2) {
+  return [[cx - w, y + endDrop], [cx - w * .72, y - back * .72], [cx, y - back], [cx + w * .72, y - back * .72], [cx + w, y + endDrop],
+    [cx + w * .74, y + front * .62], [cx, y + front], [cx - w * .74, y + front * .62]];
+}
+
+ITEMS.hat.push(
+  { id: 'beret', covers: true, name: '贝雷帽', c1: '#c4223f', pat: 'none', pc: '#ffffff', tags: ['cute', 'vintage', 'elegant', 'preppy'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(166), T = H.T;
+      // a soft disc worn tilted to the right: wider than the head, its rim arching over the forehead
+      const L = 200 - w - 19, Rr = 200 + w + 25;
+      const rim = [[L, 173], [200 - w * .5, 166], [200, 163.5], [200 + w * .5, 166], [Rr, 178]];
+      const body = [[L, 173, 1], [L - 4.5, 161], [L + 4, 139], [200 - w * .66, T - 6], [200 - w * .32, T - 19], [202, T - 23], [200 + w * .4, T - 20], [200 + w * .77, T - 6], [Rr - 1, T + 18], [Rr + 3.5, 164], [Rr, 178, 1],
+        [200 + w * .5, 166], [200, 163.5], [200 - w * .5, 166]];
+      const d = smooth(body);
+      const sx = 200 + w * .3, sy = T - 19;
+      const stem = flat(`M${r1(sx - 6)},${r1(sy + 5)}C${r1(sx - 8)},${r1(sy - 10)} ${r1(sx)},${r1(sy - 21)} ${r1(sx + 12)},${r1(sy - 20)}C${r1(sx + 19)},${r1(sy - 19)} ${r1(sx + 18)},${r1(sy - 9)} ${r1(sx + 10)},${r1(sy - 8)}C${r1(sx + 5)},${r1(sy - 7)} ${r1(sx + 5)},${r1(sy)} ${r1(sx + 6)},${r1(sy + 5)}Z`, c, lc, 2.4)
+        + ln(`M${r1(sx - 2)},${r1(sy - 6)}Q${r1(sx + 1)},${r1(sy - 12)} ${r1(sx + 7)},${r1(sy - 13)}`, '#fff', 1.6, { opacity: .16 });
+      // darker rim band (the underside rolling in), and the fold where the top drapes over to the right
+      const band = ln(smooth(rim, false), darken(c, .2), 17);
+      const fold = ln(`M${r1(200 + w * .5)},${r1(T - 5)}Q${r1(Rr - 8)},${r1(T + 12)} ${r1(Rr - 8)},${r1(167)}`, darken(c, .28), 1.8, { opacity: .55 });
+      return browShadow(ctx, H, bowEdge(L + 4, Rr - 4, 167.5, -4).map(([x, y], i, a) => [x, y + (i / (a.length - 1)) * 6]), 6, .09) + stem
+        + hatPart(ctx, d, c, { pat: it.patUrl, extra: band, lit: [17, 15, .15], shade: [10, 4, .14], after: fold, sw: 2.8 });
+    } },
+  { id: 'cap', covers: true, name: '棒球帽', c1: '#23396b', c2: '#f3ead6', pat: 'none', pc: '#ffffff', tags: ['sporty', 'street', 'casual', 'preppy'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(164);
+      // six-panel crown hugging the head, button on top, seams down to the band
+      const arc = H.arc(168, k => 8 + 9 * k);
+      const crown = arcShape(arc);
+      const seams = ln(meridian(arc, 0) + meridian(arc, .62) + meridian(arc, -.62), lc, 1.3, { opacity: .45 });
+      const top = arc[(arc.length - 1) / 2];
+      const eyelets = [-1, 1].map(s => circ(r1(200 + s * w * .4), r1(top[1] + 16), 1.6, { fill: darken(c, .3) })).join('');
+      // visor: attached along an arch at the crown's front, its rim swinging down towards the viewer
+      const vw = w + 6;
+      const visor = smooth([[200 - vw, 168, 1], [200 - vw * .55, 160.5], [200, 158.5], [200 + vw * .55, 160.5], [200 + vw, 168, 1], [200 + vw * .52, 178.5], [200, 181.5], [200 - vw * .52, 178.5]]);
+      const vStitch = stitch(smooth([[200 - vw + 6, 169], [200, 177.5], [200 + vw - 6, 169]], false), lighten(c, .35), 1) + stitch(smooth([[200 - vw + 11, 167.5], [200, 174], [200 + vw - 11, 167.5]], false), lighten(c, .35), 1);
+      const rimEdge = bowEdge(200 - vw + 2, 200 + vw - 2, 170, 11.5);
+      return browShadow(ctx, H, rimEdge, 9, .16)
+        + hatPart(ctx, crown, c, { pat: it.patUrl, lit: [7, 8, .1], shade: [10, 3, .15], after: seams + eyelets })
+        + circ(200, r1(top[1] + 1.5), 4.6, { fill: c, stroke: lc, 'stroke-width': 1.8 })
+        + path(starD(200, r1(top[1] + 27), 10, .45), { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1.2 })
+        + hatPart(ctx, visor, shadeOf(c, .04), { lit: [4, 6, .1], shade: [7, 3.2, .2], after: vStitch });
+    } },
+  { id: 'newsboy', covers: true, name: '报童帽', c1: '#7a6a55', pat: 'herring', pc: '#4e4233', tags: ['vintage', 'workwear', 'classic', 'autumn'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(162);
+      // eight soft panels puffing out over a short brim; the front panel overhangs it
+      const arc = H.arc(162, k => 15 + 10 * k);
+      const crown = arcShape(arc, [[200 + w * .55, 164], [200, 165.5], [200 - w * .55, 164]]);
+      const seams = ln([0, .4, -.4, .78, -.78].map(u => meridian(arc, u)).join(''), lc, 1.2, { opacity: .45 });
+      const top = arc[(arc.length - 1) / 2];
+      const bw = w * .78;
+      const brim = smooth([[200 - bw, 162, 1], [200, 159], [200 + bw, 162, 1], [200 + bw * .55, 175.5], [200, 179], [200 - bw * .55, 175.5]]);
+      const brimStitch = stitch(smooth([[200 - bw + 7, 166], [200, 175], [200 + bw - 7, 166]], false), lighten(c, .3), 1);
+      return browShadow(ctx, H, bowEdge(200 - bw + 4, 200 + bw - 4, 172, 6.5), 8, .15)
+        + hatPart(ctx, brim, shadeOf(c, .06), { pat: it.patUrl, shade: [5, -4, .2], after: brimStitch })
+        + hatPart(ctx, crown, c, { pat: it.patUrl, lit: [8, 9, .13], shade: [10, 5, .15], after: seams })
+        + circ(200, r1(top[1] + 1), 4.6, { fill: c, stroke: lc, 'stroke-width': 1.8 });
+    } },
+  { id: 'railroad', covers: true, name: '铁路工帽', c1: '#2c3b5e', pat: 'pin', pc: '#eeebe2', tags: ['workwear', 'vintage', 'cute'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(160);
+      // engineer cap: a puffed, pleated crown gathered into a stitched band, short stiff visor
+      const arc = H.arc(158, k => 9 + 20 * k * k);
+      const crown = arcShape(arc);
+      const pleats = ln([.25, -.25, .55, -.55, .82, -.82].map(u => meridian(arc, u)).join(''), lc, 1.2, { opacity: .35 });
+      const bw = w + 8;
+      const band = smooth([[200 - bw, 156, 1], [200, 145], [200 + bw, 156, 1], [200 + bw, 167, 1], [200, 158], [200 - bw, 167, 1]]);
+      const bandStitch = stitch(smooth([[200 - bw + 3, 158], [200, 148], [200 + bw - 3, 158]], false), lighten(c, .4), 1) + stitch(smooth([[200 - bw + 3, 164], [200, 155], [200 + bw - 3, 164]], false), lighten(c, .4), 1);
+      const vw = w * .82;
+      const visor = smooth([[200 - vw, 163, 1], [200, 157], [200 + vw, 163, 1], [200 + vw * .55, 172], [200, 175.5], [200 - vw * .55, 172]]);
+      return browShadow(ctx, H, bowEdge(200 - vw + 3, 200 + vw - 3, 170, 5.5), 8, .15)
+        + hatPart(ctx, crown, c, { pat: it.patUrl, lit: [8, 9, .12], shade: [10, 5, .15], after: pleats })
+        + hatPart(ctx, band, c, { pat: it.patUrl, shade: [6, 3, .14], after: bandStitch })
+        + hatPart(ctx, visor, darken(c, .12), { shade: [6, 3, .2], lit: [4, 5, .08] });
+    } },
+  { id: 'beanie', covers: true, name: '针织毛线帽', c1: '#c8433a', pat: 'none', pc: '#ffffff', tags: ['workwear', 'street', 'winter', 'casual'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(166);
+      // ribbed dome, fuller than the head, sitting in a wide folded cuff that covers the ear roots
+      const wc = w + 20, yT = 136, yB = 173, drop = 15;
+      const a = wc - 6, cy = yT + 15, b = cy - (H.T - 30);
+      const arc = Array.from({ length: 13 }, (_, i) => { const t = Math.PI * (1 + i / 12); return [r1(200 + Math.cos(t) * a), r1(cy + Math.sin(t) * b)]; });
+      const dome = arcShape(arc);
+      const ribs = ln(Array.from({ length: 15 }, (_, i) => meridian(arc, -.91 + i * .13)).join(''), lc, 1.1, { opacity: .3 });
+      const top = bowEdge(200 - wc + 2, 200 + wc - 2, yT + drop, -drop), bot = bowEdge(200 + wc - 2, 200 - wc + 2, yB + drop, -drop);
+      const cuff = smooth([...top, [200 + wc + 1.5, (yT + yB) / 2 + drop], ...bot, [200 - wc - 1.5, (yT + yB) / 2 + drop]]);
+      let cr = ''; for (let x = 200 - wc; x <= 200 + wc; x += 6.5) cr += `M${r1(x)},${yT - 4}V${yB + drop + 4}`;
+      const lx = 200 + wc * .56, ly = yT + drop * (1 - .56 * .56) * -1 + drop + 6;
+      const label = g(path(`M${r1(lx - 13)},${r1(ly)}h26v15h-26z`, { fill: '#f4ecd8', stroke: '#a89b80', 'stroke-width': 1.3 }) + ln(`M${r1(lx - 10)},${r1(ly + 3)}h20`, '#c9bda2', .9, { 'stroke-dasharray': '2 1.6' }), { transform: `rotate(6 ${r1(lx)} ${r1(ly + 7)})` });
+      return browShadow(ctx, H, bot.slice().reverse(), 6, .09)
+        + hatPart(ctx, dome, c, { pat: it.patUrl, shade: [12, 5, .15], after: ribs })
+        + hatPart(ctx, cuff, shadeOf(c, .03), { pat: it.patUrl, shade: [7, 5, .16], after: ln(cr, lc, 1.1, { opacity: .34 }), sw: 2.8 }) + label;
+    } },
+  { id: 'fedora', covers: true, name: '软呢帽', c1: '#4c433b', c2: '#2a2420', pat: 'none', pc: '#ffffff', tags: ['classic', 'vintage', 'elegant', 'cool'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(160), yb = 153;
+      const Wb = w + 40, cw = w * .9, ch = 58;
+      const brim = smooth(brimPts(200, yb, Wb, 12, 15));
+      // teardrop crown: a soft dip in the middle of the top, two front pinches, ribbon band with a side bow
+      const crown = smooth([[200 - cw, yb + 2, 1], [200 - cw * .96, yb - ch * .45], [200 - cw * .84, yb - ch * .8], [200 - cw * .56, yb - ch], [200 - cw * .2, yb - ch * .98], [200, yb - ch * .86],
+        [200 + cw * .2, yb - ch * .98], [200 + cw * .56, yb - ch], [200 + cw * .84, yb - ch * .8], [200 + cw * .96, yb - ch * .45], [200 + cw, yb + 2, 1], [200 + cw * .5, yb + 6], [200, yb + 7], [200 - cw * .5, yb + 6]]);
+      const pinch = ln(`M${r1(200 - cw * .44)},${r1(yb - ch * .9)}Q${r1(200 - cw * .24)},${r1(yb - ch * .66)} ${r1(200 - cw * .3)},${r1(yb - ch * .36)}M${r1(200 + cw * .44)},${r1(yb - ch * .9)}Q${r1(200 + cw * .24)},${r1(yb - ch * .66)} ${r1(200 + cw * .3)},${r1(yb - ch * .36)}M200,${r1(yb - ch * .86)}V${r1(yb - ch * .66)}`, darken(c, .3), 1.6, { opacity: .6 });
+      const band = smooth([[200 - cw, yb - 9, 1], [200, yb - 4], [200 + cw, yb - 9, 1], [200 + cw, yb + 2, 1], [200 + cw * .5, yb + 6], [200, yb + 7], [200 - cw * .5, yb + 6], [200 - cw, yb + 2, 1]]);
+      const bx = 200 - cw + 10;
+      const bow = flat(`M${bx - 2},${yb - 6}l-7,-3l-1,8z`, it.c2, lineOf(it.c2), 1.4) + flat(`M${bx - 2},${yb - 6}l-5,6l3,6l4,-5z`, it.c2, lineOf(it.c2), 1.4) + circ(bx - 2, yb - 4, 2.4, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1.2 });
+      return browShadow(ctx, H, [[200 - Wb + 8, yb + 6], [200 - Wb * .6, yb + 11], [200, yb + 15], [200 + Wb * .6, yb + 11], [200 + Wb - 8, yb + 6]], 8, .15)
+        + hatPart(ctx, brim, c, { pat: it.patUrl, lit: [10, 6, .1], shade: [10, 3, .17] })
+        + hatPart(ctx, crown, c, { pat: it.patUrl, lit: [8, 9, .12], shade: [10, 4, .16], after: pinch })
+        + hatPart(ctx, band, it.c2, { shade: [6, 2, .2], sw: 2 }) + bow;
+    } },
+  { id: 'boater', covers: true, name: '硬草帽', c1: '#efd38a', c2: '#23396b', pat: 'none', pc: '#ffffff', tags: ['preppy', 'vintage', 'summer', 'classic'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(158), yb = 152;
+      const Wb = w + 35, cw = w * .86, ch = 38;
+      const bp = brimPts(200, yb, Wb, 9, 13, 1);
+      const brim = smooth(bp);
+      let weave = '';
+      for (const k of [.92, .8, .68]) weave += smooth(brimPts(200, yb, Wb * k, 9 * k, 13 * k, 1), true).replace('Z', '');
+      // flat-topped straw cylinder, striped ribbon round the base
+      const crown = smooth([[200 - cw, yb + 2, 1], [200 - cw, yb - ch, 1], [200 - cw * .5, yb - ch + 4], [200, yb - ch + 5], [200 + cw * .5, yb - ch + 4], [200 + cw, yb - ch, 1], [200 + cw, yb + 2, 1],
+        [200 + cw * .5, yb + 5.5], [200, yb + 6.5], [200 - cw * .5, yb + 5.5]]);
+      let rows = ''; for (let y = yb - ch + 9; y < yb - 10; y += 4.2) rows += smooth([[200 - cw, y], [200, y + 5], [200 + cw, y]], false);
+      const topD = `M${r1(200 - cw)},${yb - ch}a${r1(cw)},5.5 0 1,0 ${r1(2 * cw)},0a${r1(cw)},5.5 0 1,0 ${r1(-2 * cw)},0Z`;
+      const band = smooth([[200 - cw, yb - 12, 1], [200, yb - 6.5], [200 + cw, yb - 12, 1], [200 + cw, yb + 2, 1], [200 + cw * .5, yb + 5.5], [200, yb + 6.5], [200 - cw * .5, yb + 5.5], [200 - cw, yb + 2, 1]]);
+      const stripe = path(smooth([[200 - cw - 2, yb - 7.5], [200, yb - 2], [200 + cw + 2, yb - 7.5], [200 + cw + 2, yb - 3.5], [200, yb + 2], [200 - cw - 2, yb - 3.5]]), { fill: '#c9374b' });
+      return browShadow(ctx, H, [[200 - Wb + 8, yb + 5], [200 - Wb * .6, yb + 9.5], [200, yb + 13], [200 + Wb * .6, yb + 9.5], [200 + Wb - 8, yb + 5]], 8, .14)
+        + hatPart(ctx, brim, c, { pat: it.patUrl, extra: ln(weave, lc, .9, { opacity: .3 }), lit: [10, 5, .14], shade: [10, 3, .16] })
+        + hatPart(ctx, crown, c, { pat: it.patUrl, extra: ln(rows, lc, .9, { opacity: .3 }), shade: [10, 0, .16] })
+        + hatPart(ctx, topD, lighten(c, .16), { shade: [8, 2, .1], sw: 2.2 })
+        + hatPart(ctx, band, it.c2, { extra: stripe, shade: [6, 0, .18], sw: 2 });
+    } },
+  { id: 'sunhat', covers: true, name: '遮阳大草帽', c1: '#f4ddb0', c2: '#ff8fab', pat: 'none', pc: '#ffffff', tags: ['summer', 'sweet', 'nature', 'elegant'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(156), yb = 151;
+      const Wb = w + 64, cw = w * .88;
+      // wide floppy brim: scalloped edge, the sides and front drooping
+      const rim = k => { const pts = []; for (let i = 0; i < 28; i++) { const a = i / 28 * Math.PI * 2, s = Math.sin(a), co = Math.cos(a);
+        pts.push([r1(200 + co * Wb * k * (1 + .022 * Math.cos(a * 9))), r1(yb + (s > 0 ? s * 24 : s * 15) * k + 7 * co * co * k)]); } return pts; };
+      const brim = smooth(rim(1));
+      let weave = ''; for (const k of [.88, .74]) weave += smooth(rim(k), true);
+      const crown = smooth([[200 - cw, yb + 3, 1], [200 - cw * .98, yb - 21], [200 - cw * .8, yb - 38], [200 - cw * .45, yb - 47], [200, yb - 49], [200 + cw * .45, yb - 47],
+        [200 + cw * .8, yb - 38], [200 + cw * .98, yb - 21], [200 + cw, yb + 3, 1], [200 + cw * .5, yb + 7], [200, yb + 8], [200 - cw * .5, yb + 7]]);
+      let rows = ''; for (let y = yb - 38; y < yb - 10; y += 5) rows += smooth([[200 - cw, y + 2], [200, y + 6], [200 + cw, y + 2]], false);
+      const band = smooth([[200 - cw, yb - 9, 1], [200, yb - 3], [200 + cw, yb - 9, 1], [200 + cw, yb + 3, 1], [200 + cw * .5, yb + 7], [200, yb + 8], [200 - cw * .5, yb + 7], [200 - cw, yb + 3, 1]]);
+      const bx = 200 + cw - 6, by = yb - 3, pc = it.c2, pl = lineOf(pc);
+      const bow = flat(`M${bx},${by + 2}Q${bx + 8},${by + 16} ${bx + 3},${by + 30}L${bx + 10},${by + 27}Q${bx + 13},${by + 14} ${bx + 3},${by + 1}Z`, pc, pl, 1.6)
+        + flat(smooth([[bx, by], [bx - 12, by - 9], [bx - 14, by + 5, 1], [bx - 3, by + 2], [bx + 3, by + 2], [bx + 14, by + 5, 1], [bx + 12, by - 9]]), pc, pl, 1.8) + circ(bx, by + 1, 3.2, { fill: pc, stroke: pl, 'stroke-width': 1.4 });
+      return browShadow(ctx, H, [[200 - Wb * .5, yb + 18], [200, yb + 24], [200 + Wb * .5, yb + 18]], 10, .14)
+        + hatPart(ctx, brim, c, { pat: it.patUrl, extra: ln(weave, lc, .9, { opacity: .28 }), lit: [12, 6, .12], shade: [12, 4, .15] })
+        + hatPart(ctx, crown, c, { pat: it.patUrl, extra: ln(rows, lc, .9, { opacity: .28 }), lit: [8, 8, .12], shade: [10, 4, .15] })
+        + hatPart(ctx, band, pc, { shade: [6, 0, .16], sw: 1.8 }) + bow;
+    } },
+  { id: 'witch', covers: true, name: '巫师帽', c1: '#3a2a62', c2: '#ffd166', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'party', 'cool'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(158), yb = 152;
+      const Wb = w + 46, cw = w * .84;
+      const bp = brimPts(200, yb, Wb, 12, 18, -1);
+      const brim = smooth(bp);
+      // tall cone whose tip flops over to the right
+      const cone = smooth([[200 - cw, yb + 2, 1], [200 - cw * .74, yb - 30], [200 - cw * .4, yb - 62], [200 - 5, yb - 90], [200 + 20, yb - 110], [200 + 50, yb - 118, 1], [200 + 33, yb - 101],
+        [200 + 25, yb - 82], [200 + cw * .45, yb - 52], [200 + cw * .78, yb - 22], [200 + cw, yb + 2, 1], [200 + cw * .5, yb + 6], [200, yb + 7], [200 - cw * .5, yb + 6]]);
+      const band = smooth([[200 - cw * .98, yb - 11, 1], [200, yb - 5], [200 + cw * .98, yb - 11, 1], [200 + cw, yb + 2, 1], [200 + cw * .5, yb + 6], [200, yb + 7], [200 - cw * .5, yb + 6], [200 - cw, yb + 2, 1]]);
+      const buckle = path(`M191,${yb - 8}h18v13h-18z`, { fill: 'none', stroke: '#5a4520', 'stroke-width': 4.4 }) + path(`M191,${yb - 8}h18v13h-18z`, { fill: 'none', stroke: '#ffe9a8', 'stroke-width': 2.4 })
+        + ln(`M192.5,${yb - 6.5}h6`, '#fff', 1.4, { opacity: .9 });
+      const stars = path(starD(214, yb - 62, 7, .45), { fill: it.c2 }) + path(starD(194, yb - 36, 4.4, .45), { fill: it.c2 }) + path(starD(226, yb - 26, 3.4, .45), { fill: it.c2 });
+      return browShadow(ctx, H, [[200 - Wb + 10, yb + 6], [200 - Wb * .6, yb + 13], [200, yb + 18], [200 + Wb * .6, yb + 13], [200 + Wb - 10, yb + 6]], 8, .16)
+        + hatPart(ctx, brim, c, { pat: it.patUrl, lit: [10, 6, .1], shade: [10, 3, .18] })
+        + hatPart(ctx, cone, c, { pat: it.patUrl, extra: stars, lit: [7, 8, .1], shade: [9, 4, .18] })
+        + hatPart(ctx, band, it.c2, { shade: [6, 0, .16], sw: 2 }) + buckle;
+    } },
+  { id: 'bandana', covers: true, name: '复古头巾', c1: '#c8243c', pat: 'dot', pc: '#ffffff', tags: ['workwear', 'vintage', 'street', 'summer'],
+    draw: (env, it) => {
+      const { ctx } = env, H = hatFit(env.st), c = it.c1, lc = lineOf(c), w = H.W(168);
+      // kerchief tied snug over the head: folded hem across the forehead, knot and tails on the right
+      const arc = H.arc(172, k => 3.5 + 5 * k);
+      const hem = bowEdge(arc[arc.length - 1][0], arc[0][0], 172, -10);
+      const d = arcShape(arc, hem.slice(1, -1));
+      const hemLine = ln(smooth(bowEdge(arc[0][0] + 2, arc[arc.length - 1][0] - 2, 165, -9), false), lc, 1.4, { opacity: .5 });
+      const kx = 200 + w + 4, ky = 160;
+      const folds = ln(`M${kx - 8},${ky - 4}Q${200 + w * .45},${H.T + 18} ${200 - w * .1},${H.T + 10}M${kx - 6},${ky + 3}Q${200 + w * .35},${ky - 18} ${200 - w * .25},${ky - 22}`, darken(c, .3), 1.4, { opacity: .45 });
+      const tails = hatPart(ctx, `M${kx - 2},${ky - 2}L${kx + 22},${ky - 12}L${kx + 18},${ky + 2}L${kx + 2},${ky + 4}Z`, c, { pat: it.patUrl, shade: [5, 3, .2], sw: 2.2 })
+        + hatPart(ctx, `M${kx},${ky + 2}L${kx + 16},${ky + 22}L${kx + 4},${ky + 24}L${kx - 4},${ky + 6}Z`, c, { pat: it.patUrl, shade: [5, 3, .2], sw: 2.2 });
+      const knot = hatPart(ctx, `M${kx - 7},${ky - 5}Q${kx},${ky - 11} ${kx + 6},${ky - 4}Q${kx + 8},${ky + 3} ${kx + 1},${ky + 7}Q${kx - 7},${ky + 6} ${kx - 7},${ky - 5}Z`, shadeOf(c, .05), { pat: it.patUrl, shade: [4, 3, .22], sw: 2.2 });
+      return browShadow(ctx, H, bowEdge(arc[0][0] + 4, arc[arc.length - 1][0] - 4, 172, -10), 6, .12) + tails
+        + hatPart(ctx, d, c, { pat: it.patUrl, lit: [7, 8, .12], shade: [10, 4, .15], after: folds + hemLine }) + knot;
+    } },
+  { id: 'crown', name: '小皇冠', c1: '#f2c75c', c2: '#ff4f8b', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'party', 'elegant'],
+    draw: (env, it) => {
+      const d = 'M156,112L150,70L172,90L186,58L200,84L214,58L228,90L250,70L244,112Q200,104 156,112Z';
+      return hp(env, it, d, { shade: 'tb' }) + ln('M156,104Q200,96 244,104', lighten(it.c1, .5), 2) + circ(200, 98, 5, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1.4 })
+        + circ(176, 100, 3.5, { fill: '#5bc0eb' }) + circ(224, 100, 3.5, { fill: '#5bc0eb' }) + circ(150, 68, 4, { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.4 }) + circ(186, 56, 4, { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.4 }) + circ(214, 56, 4, { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.4 }) + circ(250, 68, 4, { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.4 });
+    } },
+  { id: 'flowercrown', name: '花环', c1: '#ffb3c8', c2: '#fff3a8', pat: 'none', pc: '#ffffff', tags: ['nature', 'sweet', 'fantasy', 'summer'],
+    draw: (env, it) => {
+      let s = '';
+      const pts = [[122, 140], [140, 122], [162, 112], [186, 106], [212, 106], [238, 110], [260, 120], [278, 136]];
+      s += ln(smooth(pts, false), '#5f9e5a', 4);
+      pts.forEach(([x, y], i) => {
+        s += ell(x + 9, y + 6, 7, 3.4, { fill: '#7cc37a', stroke: '#4a7e46', 'stroke-width': 1, transform: `rotate(${30 + i * 10} ${x + 9} ${y + 6})` });
+      });
+      pts.forEach(([x, y], i) => {
+        const c = i % 3 === 1 ? '#ffffff' : i % 3 === 2 ? lighten(it.c1, .3) : it.c1;
+        for (let k = 0; k < 5; k++) { const a = k * 1.2566 + i; s += circ(x + Math.cos(a) * 6, y + Math.sin(a) * 6, 5.4, { fill: c, stroke: lineOf(c), 'stroke-width': 1.2 }); }
+        s += circ(x, y, 3.8, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1 });
+      });
+      return s;
+    } },
+  { id: 'bigbow', name: '大蝴蝶结', c1: '#ff6f91', pat: 'none', pc: '#ffffff', tags: ['cute', 'sweet', 'party'],
+    draw: (env, it) => {
+      const d = smooth([[236, 104], [256, 78], [282, 74], [292, 96], [280, 116], [252, 114, 1], [264, 140], [254, 152, 1], [244, 120], [234, 118], [224, 150, 1], [212, 140], [222, 114, 1], [194, 116], [182, 96], [192, 74], [218, 78]]);
+      return hp(env, it, d) + ln('M246,104Q266,96 276,98M226,104Q206,96 196,98', lineOf(it.c1), 1.4, { opacity: .5 }) + flat('M228,100Q236,96 244,100L242,118Q236,120 230,118Z', shadeOf(it.c1, .08), lineOf(it.c1), 2);
+    } },
+  { id: 'halo', name: '天使光环', c1: '#ffe27a', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'cute', 'sweet'],
+    draw: (env, it) => ell(200, 64, 54, 13, { fill: 'none', stroke: it.c1, 'stroke-width': 14, opacity: .25 }) + ell(200, 64, 54, 13, { fill: 'none', stroke: lineOf(it.c1), 'stroke-width': 8 }) + ell(200, 64, 54, 13, { fill: 'none', stroke: it.c1, 'stroke-width': 5.4 }) + ell(184, 56, 14, 2.4, { fill: '#fff', opacity: .7 }) },
+  { id: 'horns', name: '小恶魔角', c1: '#7a2a4a', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'cool', 'party'],
+    draw: (env, it) => {
+      const h = s => { const X = x => s > 0 ? x : mirX(x); return smooth([[X(214), 118], [X(222), 92], [X(240), 70], [X(252), 64, 1], [X(246), 82], [X(236), 104], [X(232), 120]]); };
+      return hp(env, it, h(-1), { shade: 'lr' }) + hp(env, it, h(1), { shade: 'lr' });
+    } },
+  { id: 'hairpin', name: '流苏发簪', c1: '#f2c75c', c2: '#e0242f', pat: 'none', pc: '#ffffff', tags: ['chinese', 'elegant', 'party'],
+    draw: (env, it) => {
+      const lc = lineOf(it.c1);
+      let tas = '';
+      for (const [dx, len] of [[-5, 34], [0, 42], [5, 34]]) tas += ln(`M${262 + dx},126L${264 + dx * 1.4},${126 + len}`, it.c1, 1.4) + circ(264 + dx * 1.4, 126 + len + 3, 3, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1 });
+      let fl = '';
+      for (let k = 0; k < 6; k++) { const a = k * Math.PI / 3; fl += ell(262 + Math.cos(a) * 7, 114 + Math.sin(a) * 7, 6, 4, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1.2, transform: `rotate(${r1(a * 57.3)} ${r1(262 + Math.cos(a) * 7)} ${r1(114 + Math.sin(a) * 7)})` }); }
+      return ln('M226,96L288,140', lc, 5) + ln('M226,96L288,140', it.c1, 3) + tas + fl + circ(262, 114, 4.6, { fill: it.c1, stroke: lc, 'stroke-width': 1.4 });
+    } },
+  { id: 'tophat', name: '迷你礼帽', c1: '#2a2733', c2: '#c9374b', pat: 'none', pc: '#ffffff', tags: ['classic', 'party', 'vintage', 'elegant'],
+    draw: (env, it) => {
+      const g1 = `rotate(-12 236 100)`;
+      return g(hp(env, it, 'M188,106a48,10 0 1,0 96,0a48,10 0 1,0 -96,0Z', { shade: 'tb' }) + hp(env, it, 'M204,106V56Q204,50 210,50H262Q268,50 268,56V106Q236,114 204,106Z', { shade: 'lr' })
+        + path('M204,92H268V104Q236,110 204,104Z', { fill: it.c2 }) + ell(236, 50, 32, 5, { fill: lighten(it.c1, .15), stroke: lineOf(it.c1), 'stroke-width': 2 }), { transform: g1 });
+    } },
+);
+
+/* head-top accessories (crown, bows, halo…) were drawn on the old, taller fox cranium: move them onto the wearer's
+   head, and up onto the hair when a front style makes the head taller */
+for (const id of ['crown', 'flowercrown', 'bigbow', 'halo', 'horns', 'hairpin', 'tophat']) {
+  const it = ITEMS.hat.find(h => h.id === id), draw = it.draw;
+  it.draw = (env, x) => {
+    const hair = env.st.hair && HAIR_STYLES[env.st.hair.id], lift = hair ? hair.lift : 0;
+    return g(draw(env, x), { transform: `translate(0,${r1(18 + hatFit(env.st).T - hatFit({ species: 'fox' }).T - lift)})` });
+  };
+}
+
+/* ---------- glasses ---------- */
+const EYE_L = [152.5, 222], EYE_R = [247.5, 222];
+function lensPair(fn) { return fn(EYE_L[0], EYE_L[1], -1) + fn(EYE_R[0], EYE_R[1], 1); }
+ITEMS.glasses.push(
+  { id: 'round', name: '复古圆框', c1: '#3e2622', pat: 'none', pc: '#ffffff', tags: ['vintage', 'preppy', 'classic', 'cute'],
+    draw: (env, it) => lensPair((x, y, s) => circ(x, y + 2, 29.5, { fill: '#dff1ff', 'fill-opacity': .14, stroke: it.c1, 'stroke-width': 2.8 }) + ln(`M${x - 15},${y - 13}l6,-4`, '#fff', 2.4, { opacity: .6 }) + ln(`M${x + s * 29.5},${y}L${x + s * 56},${y - 7}`, it.c1, 2.6))
+      + ln(`M${EYE_L[0] + 29.5},${EYE_L[1] + 1}Q200,${EYE_L[1] - 8} ${EYE_R[0] - 29.5},${EYE_R[1] + 1}`, it.c1, 2.6) },
+  { id: 'horn', name: '学院粗框', c1: '#3a2620', pat: 'none', pc: '#ffffff', tags: ['preppy', 'classic', 'vintage', 'office'],
+    draw: (env, it) => lensPair((x, y, s) => path(`M${x - 28},${y - 18}h56q4,0 4,6v22q0,16 -16,16h-32q-16,0 -16,-16v-22q0,-6 4,-6z`, { fill: '#dff1ff', 'fill-opacity': .16, stroke: it.c1, 'stroke-width': 4.6 }) + ln(`M${x + s * 32},${y - 14}L${x + s * 54},${y - 18}`, it.c1, 4))
+      + ln(`M${EYE_L[0] + 31},206Q200,199 ${EYE_R[0] - 31},206`, it.c1, 4) },
+  { id: 'browline', name: '眉线眼镜', c1: '#2b2228', c2: '#c9a24a', pat: 'none', pc: '#ffffff', tags: ['vintage', 'classic', 'office', 'cool'],
+    draw: (env, it) => lensPair((x, y, s) => path(`M${x - 27},${y - 10}Q${x},${y - 16} ${x + 27},${y - 10}Q${x + 26},${y + 22} ${x},${y + 25}Q${x - 26},${y + 22} ${x - 27},${y - 10}Z`, { fill: '#dff1ff', 'fill-opacity': .16, stroke: it.c2, 'stroke-width': 2 })
+      + path(`M${x - 29},${y - 6}Q${x - 28},${y - 18} ${x},${y - 19}Q${x + 28},${y - 18} ${x + 29},${y - 6}L${x + 27},${y - 2}Q${x},${y - 10} ${x - 27},${y - 2}Z`, { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.4 }) + ln(`M${x + s * 29},${y - 10}L${x + s * 54},${y - 16}`, it.c1, 3.4))
+      + ln(`M${EYE_L[0] + 28},209Q200,203 ${EYE_R[0] - 28},209`, it.c2, 2.2) },
+  { id: 'aviator', name: '飞行员墨镜', c1: '#5a4632', c2: '#d8b45a', pat: 'none', pc: '#ffffff', tags: ['cool', 'vintage', 'summer', 'street'],
+    draw: (env, it) => {
+      const gid = env.ctx.def('avi-' + it.c1.slice(1), `<linearGradient id="__ID__" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="${it.c1}" stop-opacity=".95"/><stop offset="1" stop-color="${it.c1}" stop-opacity=".45"/></linearGradient>`);
+      return lensPair((x, y, s) => path(`M${x - 28 * s},${y - 14}Q${x},${y - 18} ${x + 26 * s},${y - 12}Q${x + 30 * s},${y + 6} ${x + 14 * s},${y + 22}Q${x},${y + 30} ${x - 18 * s},${y + 18}Q${x - 30 * s},${y + 4} ${x - 28 * s},${y - 14}Z`, { fill: `url(#${gid})`, stroke: it.c2, 'stroke-width': 2.2 })
+        + ln(`M${x - 16},${y - 7}l8,-3`, '#fff', 2.6, { opacity: .55 }) + ln(`M${x + 27 * s},${y - 12}L${x + 52 * s},${y - 16}`, it.c2, 2.2))
+        + ln(`M${EYE_L[0] + 27},208Q200,199 ${EYE_R[0] - 27},208M${EYE_L[0] + 29},216H${EYE_R[0] - 29}`, it.c2, 2);
+    } },
+  { id: 'sunnies', name: '方框墨镜', c1: '#1e1a22', pat: 'none', pc: '#ffffff', tags: ['cool', 'street', 'summer', 'vintage'],
+    draw: (env, it) => lensPair((x, y, s) => path(`M${x - 30},${y - 16}H${x + 30}L${x + 26},${y + 14}Q${x + 22},${y + 22} ${x + 10},${y + 22}H${x - 12}Q${x - 24},${y + 22} ${x - 28},${y + 12}Z`, { fill: '#2a2430', stroke: it.c1, 'stroke-width': 4.4, 'stroke-linejoin': 'round' })
+      + path(`M${x - 18},${y - 10}l14,0l-16,22l-6,0z`, { fill: '#fff', opacity: .22 }) + ln(`M${x + s * 30},${y - 14}L${x + s * 54},${y - 18}`, it.c1, 4))
+      + ln(`M${EYE_L[0] + 29},207H${EYE_R[0] - 29}`, it.c1, 4) },
+  { id: 'heart', name: '爱心墨镜', c1: '#ff4f8b', pat: 'none', pc: '#ffffff', tags: ['cute', 'party', 'summer', 'sweet'],
+    draw: (env, it) => lensPair((x, y, s) => path(heartD(x, y + 2, 21), { fill: lighten(it.c1, .2), 'fill-opacity': .78, stroke: it.c1, 'stroke-width': 3.4 }) + ln(`M${x - 12},${y - 8}l6,-4`, '#fff', 2.6, { opacity: .7 }) + ln(`M${x + s * 30},${y - 6}L${x + s * 54},${y - 12}`, it.c1, 3))
+      + ln(`M${EYE_L[0] + 25},211Q200,203 ${EYE_R[0] - 25},211`, it.c1, 3) },
+  { id: 'star', name: '星星派对镜', c1: '#ffcf3a', pat: 'none', pc: '#ffffff', tags: ['party', 'fantasy', 'cute'],
+    draw: (env, it) => lensPair((x, y, s) => path(starD(x, y + 2, 32, .62), { fill: '#fff6c9', 'fill-opacity': .3, stroke: it.c1, 'stroke-width': 3.4, 'stroke-linejoin': 'round' }) + ln(`M${x + s * 30},${y - 4}L${x + s * 54},${y - 12}`, it.c1, 3))
+      + ln(`M${EYE_L[0] + 28},210Q200,203 ${EYE_R[0] - 28},210`, it.c1, 3) },
+  { id: 'monocle', name: '绅士单片镜', c1: '#c9a24a', pat: 'none', pc: '#ffffff', tags: ['classic', 'vintage', 'elegant'],
+    draw: (env, it) => circ(EYE_R[0], EYE_R[1] + 2, 26, { fill: '#dff1ff', 'fill-opacity': .2, stroke: it.c1, 'stroke-width': 3.4 }) + ln(`M${EYE_R[0] - 12},${EYE_R[1] - 10}l6,-4`, '#fff', 2.4, { opacity: .7 })
+      + ln(`M${EYE_R[0] + 18},${EYE_R[1] + 22}Q${EYE_R[0] + 30},${EYE_R[1] + 70} ${EYE_R[0] + 14},${EYE_R[1] + 110}`, it.c1, 1.6, { 'stroke-dasharray': '3 2' }) },
+);
+
+/* ---------- face stickers ---------- */
+ITEMS.face.push(
+  { id: 'freckles', name: '小雀斑', c1: '#b5653a', pat: 'none', pc: '#ffffff', tags: ['cute', 'nature', 'casual'],
+    draw: (env, it) => [[128, 262], [137, 268], [146, 261], [136, 256], [272, 262], [263, 268], [254, 261], [264, 256]].map(([x, y]) => circ(x, y, 1.9, { fill: it.c1, opacity: .75 })).join('') },
+  { id: 'bandaid', name: '创可贴', c1: '#f3c9a6', pat: 'none', pc: '#ffffff', tags: ['cute', 'street', 'sporty'],
+    draw: (env, it) => g(`<rect x="-15" y="-6" width="30" height="12" rx="6" fill="${it.c1}" stroke="${lineOf(it.c1)}" stroke-width="1.6"/><rect x="-5" y="-4.5" width="10" height="9" rx="2" fill="${lighten(it.c1, .4)}"/>` + [[-3, -2], [2, -2], [-3, 2], [2, 2]].map(([x, y]) => circ(x, y, .8, { fill: lineOf(it.c1) })).join(''), { transform: 'translate(266,268) rotate(-24)' }) },
+  { id: 'starsticker', name: '星星贴纸', c1: '#ffcf3a', pat: 'none', pc: '#ffffff', tags: ['cute', 'party', 'fantasy'],
+    draw: (env, it) => path(starD(136, 268, 8, .45), { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.6, 'stroke-linejoin': 'round' }) + path(starD(121, 256, 4, .45), { fill: it.c1 }) },
+  { id: 'heartsticker', name: '爱心贴纸', c1: '#ff4f8b', pat: 'none', pc: '#ffffff', tags: ['cute', 'sweet', 'party'],
+    draw: (env, it) => path(heartD(266, 268, 7), { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.6 }) },
+  { id: 'mustache', name: '绅士小胡子', c1: '#3a2a26', pat: 'none', pc: '#ffffff', tags: ['classic', 'vintage', 'party'],
+    draw: (env, it) => g(flat('M200,253C192,246 178,246 172,254C168,260 160,260 157,253C160,266 176,268 186,260C192,256 196,256 200,258C204,256 208,256 214,260C224,268 240,266 243,253C240,260 232,260 228,254C222,246 208,246 200,253Z', it.c1, lineOf(it.c1), 1.4), { transform: 'translate(0,5)' }) },
+  { id: 'mole', name: '泪痣', c1: '#4a3036', pat: 'none', pc: '#ffffff', tags: ['elegant', 'cool'],
+    draw: (env, it) => circ(268, 258, 2.2, { fill: it.c1 }) },
+  { id: 'glitter', name: '闪闪眼妆', c1: '#ffffff', pat: 'none', pc: '#ffffff', tags: ['party', 'fantasy', 'elegant'],
+    draw: (env, it) => [[118, 204, 5], [282, 204, 5], [114, 224, 3], [286, 224, 3], [128, 188, 2.4], [272, 188, 2.4]].map(([x, y, r]) => path(starD(x, y, r, .38, 4), { fill: it.c1, stroke: '#ffc6e0', 'stroke-width': .8 })).join('') },
+);
+
+/* ---- wear_acc.js ---- */
+/* ===== wear_acc.js — neckwear, accessories, held items, back items ===== */
+const bowShape = (x, y, w, h, col) => flat(smooth([[x, y], [x - w * .55, y - h * .5], [x - w, y - h * .45], [x - w * .95, y + h * .4], [x - w * .5, y + h * .45], [x, y + 1], [x + w * .5, y + h * .45], [x + w * .95, y + h * .4], [x + w, y - h * .45], [x + w * .55, y - h * .5]]), col, lineOf(col), 2)
+  + flat(`M${x - 4.5},${y - h * .3}h9v${h * .6}h-9z`, shadeOf(col, .08), lineOf(col), 1.6);
+
+ITEMS.neck.push(
+  { id: 'ribbon', name: '缎带蝴蝶结', c1: '#e8485f', pat: 'none', pc: '#ffffff', tags: ['cute', 'sweet', 'preppy'],
+    draw: (env, it) => bowShape(CX, 306, 26, 22, it.c1) + flat(`M${CX - 4},312L${CX - 14},344L${CX - 6},340L${CX - 1},346ZM${CX + 4},312L${CX + 14},344L${CX + 6},340L${CX + 1},346Z`, it.c1, lineOf(it.c1), 1.8) },
+  { id: 'tie', name: '斜纹领带', c1: '#b8293e', pat: 'repp', pc: '#22305a', underJacket: true, tags: ['preppy', 'classic', 'office', 'vintage'],
+    draw: (env, it) => {
+      const knot = `M${CX - 8.5},297Q${CX},295.4 ${CX + 8.5},297L${CX + 5},311Q${CX},312.6 ${CX - 5},311Z`;
+      const blade = smooth([[CX - 5, 310, 1], [CX + 5, 310, 1], [CX + 9.5, 338], [CX + 12.5, 380], [CX + 13.5, 404, 1], [CX, 417, 1], [CX - 13.5, 404, 1], [CX - 12.5, 380], [CX - 9.5, 338]]);
+      const dimple = ln(`M${CX - 1},311.5Q${CX + .5},318 ${CX + 2.5},323`, lineOf(it.c1), 1.2, { opacity: .55 });
+      return paint(env.ctx, blade, it.c1, { pat: it.patUrl, shade: 'lr', sw: 2.2, extra: dimple }) + path(knot, shadowFill(.2, { transform: 'translate(1.2,2)' }))
+        + paint(env.ctx, knot, it.c1, { pat: it.patUrl, shade: 'lr', sw: 2.2 });
+    } },
+  { id: 'bowtie', name: '绅士领结', c1: '#c9374b', pat: 'dot', pc: '#ffffff', tags: ['classic', 'party', 'vintage', 'cute'],
+    draw: (env, it) => { const d = `M${CX},304L${CX - 20},293L${CX - 22},317ZM${CX},304L${CX + 20},293L${CX + 22},317Z`; return paint(env.ctx, d, it.c1, { pat: it.patUrl, sw: 2 }) + circ(CX, 305, 5, { fill: shadeOf(it.c1, .1), stroke: lineOf(it.c1), 'stroke-width': 1.8 }); } },
+  { id: 'scarf', name: '格纹围巾', c1: '#b8322a', pat: 'plaid', pc: '#e8d9a8', tags: ['winter', 'classic', 'preppy', 'cute'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const wrap = `M${CX - K.neck - 14},282Q${CX},296 ${CX + K.neck + 14},282L${CX + K.neck + 18},306Q${CX},324 ${CX - K.neck - 18},306Z`;
+      const tail = `M${CX + 8},300L${CX + 30},302L${CX + 34},418L${CX + 12},420Z`;
+      const tail2 = `M${CX + 2},302L${CX + 20},304L${CX + 14},392L${CX - 4},388Z`;
+      let fringe = '';
+      for (let x = CX + 13; x < CX + 34; x += 4) fringe += `M${x},420v8`;
+      return paint(ctx, tail2, shadeOf(it.c1, .08), { pat: it.patUrl, sw: 2.2 }) + paint(ctx, tail, it.c1, { pat: it.patUrl, sw: 2.2 }) + ln(fringe, it.c1, 2) + paint(ctx, wrap, it.c1, { pat: it.patUrl, sw: 2.4 });
+    } },
+  { id: 'pearls', name: '珍珠项链', c1: '#fbf6ee', pat: 'none', pc: '#ffffff', tags: ['elegant', 'classic', 'party', 'vintage'],
+    draw: (env, it) => {
+      const { K } = env;
+      let s = '';
+      const sp = sampleBezier({ x: CX - K.neck - 4, y: 296 }, { x: CX - K.neck, y: 330 }, { x: CX + K.neck, y: 330 }, { x: CX + K.neck + 4, y: 296 }, 13);
+      for (const p of sp) s += circ(p.x, p.y, 3.6, { fill: it.c1, stroke: '#c9bfd6', 'stroke-width': 1.1 }) + circ(p.x - 1.1, p.y - 1.2, 1.1, { fill: '#fff' });
+      return s;
+    } },
+  { id: 'bell', name: '铃铛项圈', c1: '#e8485f', c2: '#f2c75c', pat: 'none', pc: '#ffffff', tags: ['cute', 'sweet', 'fantasy'],
+    draw: (env, it) => {
+      const { K } = env;
+      return flat(`M${CX - K.neck - 2},290Q${CX},300 ${CX + K.neck + 2},290L${CX + K.neck + 2},299Q${CX},309 ${CX - K.neck - 2},299Z`, it.c1, lineOf(it.c1), 2)
+        + circ(CX, 312, 8, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 2 }) + ln(`M${CX - 7.5},311H${CX + 7.5}`, lineOf(it.c2), 1.4) + circ(CX, 315, 1.8, { fill: lineOf(it.c2) }) + circ(CX - 3, 308, 1.8, { fill: '#fff', opacity: .7 });
+    } },
+  { id: 'neckerchief', name: '牛仔方巾', c1: '#c8243c', pat: 'dot', pc: '#ffffff', tags: ['workwear', 'vintage', 'street', 'casual'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const tri = `M${CX - K.neck - 10},290Q${CX},302 ${CX + K.neck + 10},290L${CX + 10},334L${CX},350L${CX - 10},334Z`;
+      return paint(ctx, tri, it.c1, { pat: it.patUrl, sw: 2.2 }) + flat(`M${CX + K.neck + 4},292l12,-2l2,10l-10,2z`, shadeOf(it.c1, .1), lineOf(it.c1), 1.6);
+    } },
+  { id: 'pendant', name: '宝石吊坠', c1: '#d8b45a', c2: '#5bc0eb', pat: 'none', pc: '#ffffff', tags: ['elegant', 'party', 'fantasy'],
+    draw: (env, it) => {
+      const { K } = env;
+      return ln(`M${CX - K.neck - 3},294Q${CX},346 ${CX + K.neck + 3},294`, it.c1, 1.4) + path(`M${CX},328l7,8l-7,10l-7,-10z`, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1.6 }) + ln(`M${CX - 2},333l2,-2`, '#fff', 1.4);
+    } },
+);
+
+ITEMS.acc.push(
+  { id: 'suspenders', name: '复古背带', c1: '#7a2a32', pat: 'none', pc: '#ffffff', layer: 'accMid', tags: ['vintage', 'workwear', 'classic', 'preppy'],
+    draw: (env, it) => {
+      const { K } = env;
+      const lc = lineOf(it.c1);
+      const strap = s => { const X = d => CX + s * d; return flat(`M${X(18)},420L${X(28)},420L${X(K.sh - 12)},306L${X(K.sh - 21)},304Z`, it.c1, lc, 2) + path(`M${X(16)},414h${s * 14}v10h${-s * 14}z`, { fill: '#c9c4bd', stroke: '#6a6670', 'stroke-width': 1.2 }); };
+      return strap(-1) + strap(1);
+    } },
+  { id: 'belt', name: '复古皮带', c1: '#6b3f26', c2: '#d8b45a', pat: 'none', pc: '#ffffff', layer: 'belt', tags: ['vintage', 'workwear', 'classic', 'casual'],
+    draw: (env, it) => {
+      const { K } = env;
+      const w = K.wa + 5;
+      return flat(`M${CX - w},410H${CX + w}V421H${CX - w}Z`, it.c1, lineOf(it.c1), 2) + path(`M${CX - 9},407h18v17h-18z`, { fill: 'none', stroke: it.c2, 'stroke-width': 2.6 }) + ln(`M${CX},409V422`, it.c2, 2) + stitch(`M${CX - w + 2},413H${CX - 12}M${CX + 12},413H${CX + w - 2}`, lighten(it.c1, .4), 1);
+    } },
+  { id: 'watch', name: '复古腕表', c1: '#d8b45a', c2: '#5a3a28', pat: 'none', pc: '#ffffff', layer: 'accMid', tags: ['classic', 'vintage', 'office', 'preppy'], draw: () => '' },
+  { id: 'crossbody', name: '帆布斜挎包', c1: '#c08a4a', c2: '#5a3a28', pat: 'none', pc: '#ffffff', layer: 'accTop', tags: ['workwear', 'casual', 'vintage', 'street'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const strap = ln(`M${CX + K.sh - 16},306L${CX - K.hi - 4},452`, it.c2, 7) + ln(`M${CX + K.sh - 16},306L${CX - K.hi - 4},452`, lighten(it.c2, .3), 1.2, { 'stroke-dasharray': '3 3' });
+      const bx = CX - K.hi - 30, by = 440;
+      const bag = paint(ctx, `M${bx},${by}h48q4,0 4,4v34q0,6 -6,6h-40q-6,0 -6,-6v-34q0,-4 4,-4z`, it.c1, { pat: it.patUrl })
+        + flat(`M${bx - 1},${by}h50v18q-25,6 -50,0z`, shadeOf(it.c1, .08), lineOf(it.c1), 2) + path(`M${bx + 20},${by + 12}h10v10h-10z`, { fill: it.c2 });
+      return strap + bag;
+    } },
+  { id: 'pins', name: '徽章别针', c1: '#ff6f91', pat: 'none', pc: '#ffffff', layer: 'accTop', tags: ['cute', 'street', 'casual'],
+    draw: (env, it) => {
+      const { K } = env;
+      const x = CX + K.ch - 14;
+      return circ(x, 352, 8, { fill: '#ffd166', stroke: lineOf('#ffd166'), 'stroke-width': 1.6 }) + path(`M${x - 3},350h.1M${x + 3},350h.1`, { stroke: '#3a2a26', 'stroke-width': 2.4, 'stroke-linecap': 'round' }) + ln(`M${x - 4},354Q${x},358 ${x + 4},354`, '#3a2a26', 1.4)
+        + path(heartD(x - 14, 372, 6), { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 1.4 }) + path(starD(x + 4, 380, 7, .45), { fill: '#7ec4ff', stroke: lineOf('#7ec4ff'), 'stroke-width': 1.4, 'stroke-linejoin': 'round' });
+    } },
+);
+
+/* ---------- held items: draw(env, it, at, arm) — at = paw center ---------- */
+ITEMS.held.push(
+  { id: 'icecream', name: '双球冰淇淋', c1: '#ffb3c8', c2: '#bfe8d6', grip: 'cup', pat: 'none', pc: '#ffffff', tags: ['cute', 'summer', 'sweet'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      let wafer = '';
+      for (let i = -2; i <= 2; i++) wafer += `M${x + i * 5 - 4},${y - 14}L${x + i * 3 + 4},${y + 16}`;
+      return flat(`M${x - 11},${y - 16}L${x + 11},${y - 16}L${x},${y + 20}Z`, '#e9b56d', '#9a6a32', 2) + ln(wafer, '#b07a3a', 1, { opacity: .7 })
+        + circ(x, y - 22, 12, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 2 }) + circ(x + 1, y - 40, 11, { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 2 })
+        + circ(x + 3, y - 54, 4.5, { fill: '#e63946', stroke: '#9a1f2a', 'stroke-width': 1.4 }) + ln(`M${x + 4},${y - 58}q2,-6 6,-6`, '#3a7a3a', 1.4) + circ(x - 4, y - 44, 2.6, { fill: '#fff', opacity: .7 });
+    } },
+  { id: 'boba', name: '珍珠奶茶', c1: '#e8c9a8', c2: '#ff8fab', grip: 'cup', pat: 'none', pc: '#ffffff', tags: ['cute', 'casual', 'sweet', 'street'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      let pearls = '';
+      for (let i = 0; i < 6; i++) pearls += circ(x - 8 + (i % 3) * 8, y + 10 - Math.floor(i / 3) * 6, 3, { fill: '#3a2a26' });
+      return flat(`M${x - 13},${y - 22}L${x + 13},${y - 22}L${x + 10},${y + 18}Q${x},${y + 21} ${x - 10},${y + 18}Z`, it.c1, '#9a7a5a', 2) + pearls
+        + flat(`M${x - 15},${y - 22}Q${x},${y - 36} ${x + 15},${y - 22}Z`, '#fffaf2', '#b8aecb', 1.8) + ln(`M${x + 3},${y - 30}L${x + 8},${y - 52}`, it.c2, 5) + ln(`M${x - 12},${y - 10}H${x + 12}`, '#fff', 3, { opacity: .5 });
+    } },
+  { id: 'coffee', name: '外带咖啡', c1: '#fffaf2', c2: '#8a5a3c', grip: 'cup', pat: 'none', pc: '#ffffff', tags: ['casual', 'office', 'classic', 'autumn'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      return flat(`M${x - 12},${y - 20}L${x + 12},${y - 20}L${x + 9},${y + 18}H${x - 9}Z`, it.c1, '#b8aecb', 2) + flat(`M${x - 12},${y - 6}H${x + 12}L${x + 11},${y + 6}H${x - 11}Z`, it.c2, lineOf(it.c2), 1.6)
+        + flat(`M${x - 14},${y - 20}H${x + 14}V${y - 26}Q${x},${y - 32} ${x - 14},${y - 26}Z`, '#f4efe6', '#b8aecb', 1.8) + ln(`M${x - 2},${y - 36}q4,-5 0,-10M${x + 5},${y - 38}q4,-5 0,-10`, '#c9bfd6', 1.6, { opacity: .8 });
+    } },
+  { id: 'camera', name: '复古相机', c1: '#2b2a30', c2: '#d9d2c4', grip: 'cup', pat: 'none', pc: '#ffffff', tags: ['vintage', 'casual', 'street'],
+    draw: (env, it, at) => {
+      const x = at.x - 14, y = at.y - 6;
+      return flat(`M${x - 24},${y - 18}h48v30h-48z`, it.c2, lineOf(it.c2), 2) + flat(`M${x - 24},${y - 6}h48v18h-48z`, it.c1, lineOf(it.c1), 2)
+        + circ(x + 2, y - 2, 11, { fill: '#3a3a44', stroke: '#16151a', 'stroke-width': 2 }) + circ(x + 2, y - 2, 6, { fill: '#5b6c8a' }) + circ(x - 1, y - 5, 2, { fill: '#fff', opacity: .7 })
+        + path(`M${x - 18},${y - 24}h10v6h-10z`, { fill: it.c1 }) + circ(x + 16, y - 12, 3, { fill: '#fffbe0', stroke: '#9a9480', 'stroke-width': 1 });
+    } },
+  { id: 'balloon', name: '爱心气球', c1: '#ff4f8b', grip: 'down', pat: 'none', pc: '#ffffff', tags: ['cute', 'party', 'sweet'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      const bx = Math.min(x + 34, 370), by = 120;
+      return ln(`M${x},${y}C${x + 20},${y - 80} ${bx - 20},${by + 160} ${bx},${by + 36}`, '#8a7f99', 1.4)
+        + path(heartD(bx, by, 32), { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 2.4 }) + ell(bx - 12, by - 10, 6, 9, { fill: '#fff', opacity: .45, transform: `rotate(-30 ${bx - 12} ${by - 10})` })
+        + path(`M${bx - 3},${by + 30}l3,6l3,-6z`, { fill: it.c1 });
+    } },
+  { id: 'bouquet', name: '花束', c1: '#ff8fab', c2: '#fff6e6', grip: 'front', pat: 'none', pc: '#ffffff', tags: ['sweet', 'elegant', 'nature', 'party'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      let fl = ln(`M${x - 4},${y + 16}L${x - 12},${y - 34}M${x},${y + 16}L${x},${y - 44}M${x + 4},${y + 16}L${x + 14},${y - 32}`, '#5f9e5a', 2.6);
+      const flower = (fx, fy, c, r) => { let s = ''; for (let k = 0; k < 6; k++) { const a = k * Math.PI / 3; s += circ(fx + Math.cos(a) * r * .55, fy + Math.sin(a) * r * .55, r * .5, { fill: c, stroke: lineOf(c), 'stroke-width': 1 }); } return s + circ(fx, fy, r * .35, { fill: '#ffe066' }); };
+      fl += ell(x - 22, y - 34, 9, 4, { fill: '#7cc37a', stroke: '#4a7e46', 'stroke-width': 1, transform: `rotate(-30 ${x - 22} ${y - 34})` }) + ell(x + 22, y - 30, 9, 4, { fill: '#7cc37a', stroke: '#4a7e46', 'stroke-width': 1, transform: `rotate(30 ${x + 22} ${y - 30})` });
+      fl += flower(x - 13, y - 38, it.c1, 15) + flower(x + 14, y - 36, lighten(it.c1, .35), 14) + flower(x, y - 50, '#ffffff', 15) + flower(x - 2, y - 28, darken(it.c1, .1), 12);
+      const paper = flat(`M${x - 26},${y - 24}L${x + 26},${y - 24}L${x + 6},${y + 26}H${x - 6}Z`, it.c2, lineOf(it.c2), 2) + flat(`M${x - 8},${y + 4}h16v6h-16z`, '#ff6f91', lineOf('#ff6f91'), 1.4);
+      return paper + fl + bowShape(x, y + 6, 12, 10, '#ff6f91');
+    } },
+  { id: 'wand', name: '星星魔法棒', c1: '#ffd166', c2: '#ff8fc8', grip: 'cup', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'cute', 'party'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      return ln(`M${x},${y + 14}L${x + 8},${y - 54}`, '#fff', 5) + ln(`M${x},${y + 14}L${x + 8},${y - 54}`, it.c2, 3) + path(starD(x + 9, y - 64, 15, .45), { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 2.2, 'stroke-linejoin': 'round' })
+        + ln(`M${x + 8},${y - 52}q-16,8 -20,24M${x + 8},${y - 52}q14,10 12,26`, it.c2, 1.8) + path(starD(x - 14, y - 76, 3.4, .4, 4), { fill: '#fff' }) + path(starD(x + 30, y - 70, 2.6, .4, 4), { fill: '#fff' });
+    } },
+  { id: 'briefcase', name: '复古公文包', c1: '#7a4428', pat: 'none', pc: '#ffffff', grip: 'down', tags: ['classic', 'office', 'vintage', 'preppy'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      const lc = lineOf(it.c1);
+      return path(`M${x - 9},${y + 6}V${y - 4}Q${x - 9},${y - 9} ${x - 4},${y - 9}H${x + 4}Q${x + 9},${y - 9} ${x + 9},${y - 4}V${y + 6}`, { fill: 'none', stroke: darken(it.c1, .2), 'stroke-width': 4.5 })
+        + paint(env.ctx, `M${x - 34},${y + 6}h68q4,0 4,4v46q0,4 -4,4h-68q-4,0 -4,-4v-46q0,-4 4,-4z`, it.c1, { shade: 'tb' }) + ln(`M${x - 38},${y + 22}H${x + 38}`, lc, 1.6)
+        + path(`M${x - 6},${y + 18}h12v9h-12z`, { fill: '#d8b45a', stroke: '#8a7230', 'stroke-width': 1.2 }) + stitch(`M${x - 34},${y + 10}h68`, lighten(it.c1, .35), 1);
+    } },
+  { id: 'books', name: '皮带书本', c1: '#2f4e8a', c2: '#a23b4a', grip: 'down', pat: 'none', pc: '#ffffff', tags: ['preppy', 'vintage', 'classic', 'cute'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      const book = (yy, w, c) => flat(`M${x - w},${yy}h${w * 2}v12h${-w * 2}z`, c, lineOf(c), 1.8) + path(`M${x + w - 6},${yy + 2}h4v8h-4z`, { fill: '#f6f0e1' });
+      return ln(`M${x},${y - 4}V${y + 64}`, '#6b3f26', 5) + book(y + 16, 26, it.c1) + book(y + 28, 23, it.c2) + book(y + 40, 27, '#3f6b4a') + ln(`M${x - 8},${y + 4}Q${x},${y - 6} ${x + 8},${y + 4}`, '#6b3f26', 4) + path(`M${x - 5},${y + 50}h10v8h-10z`, { fill: 'none', stroke: '#d8b45a', 'stroke-width': 2 });
+    } },
+  { id: 'racket', name: '木网球拍', c1: '#c9955a', c2: '#f6f0e1', grip: 'down', pat: 'none', pc: '#ffffff', tags: ['preppy', 'sporty', 'vintage', 'summer'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      const hx = x + 10, hy = y + 74;
+      let strings = '';
+      for (let i = -3; i <= 3; i++) strings += `M${hx + i * 5},${hy - 30}V${hy + 30}M${hx - 20},${hy + i * 8}H${hx + 20}`;
+      return ln(`M${x - 1},${y - 10}L${hx},${hy - 34}`, '#7a5032', 6) + g(ln(strings, '#e8e2d2', 1, { opacity: .9 }), { 'clip-path': env.ctx.clip(`M${hx - 22},${hy}a22,34 0 1,0 44,0a22,34 0 1,0 -44,0Z`) })
+        + ell(hx, hy, 22, 34, { fill: 'none', stroke: it.c1, 'stroke-width': 5 }) + ell(hx, hy, 22, 34, { fill: 'none', stroke: lineOf(it.c1), 'stroke-width': 1, opacity: .6 });
+    } },
+  { id: 'umbrella', name: '绅士长柄伞', c1: '#2a2733', pat: 'none', pc: '#ffffff', grip: 'down', tags: ['classic', 'office', 'vintage', 'elegant'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      const lc = lineOf(it.c1);
+      return path(`M${x + 6},${y + 4}C${x + 6},${y - 14} ${x - 14},${y - 14} ${x - 14},${y - 2}`, { fill: 'none', stroke: '#7a4a2a', 'stroke-width': 5, 'stroke-linecap': 'round' })
+        + ln(`M${x + 6},${y + 4}L${x + 8},${y + 30}`, '#b9b2c4', 3) + flat(`M${x + 2},${y + 30}L${x + 14},${y + 30}L${x + 18},${y + 150}L${x + 10},${710 - 10 > y + 150 ? 690 : y + 160}L${x + 2},${y + 150}Z`, it.c1, lc, 2) + ln(`M${x + 10},${y + 34}L${x + 10},${y + 150}`, lc, 1.2, { opacity: .6 });
+    } },
+  { id: 'fan', name: '团扇', c1: '#fff6ec', c2: '#ff6f91', grip: 'cup', pat: 'none', pc: '#ffffff', tags: ['chinese', 'elegant', 'summer', 'vintage'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      const cx = x + 4, cy = y - 52;
+      let bloss = '';
+      for (const [bx, by, r] of [[cx - 6, cy - 6, 4.4], [cx + 8, cy + 2, 3.6], [cx - 2, cy + 10, 3]]) { for (let k = 0; k < 5; k++) { const a = k * 1.2566; bloss += circ(bx + Math.cos(a) * r * .7, by + Math.sin(a) * r * .7, r * .55, { fill: it.c2 }); } bloss += circ(bx, by, r * .3, { fill: '#ffe066' }); }
+      return ln(`M${x},${y + 14}L${cx},${cy + 26}`, '#8a5a3a', 3.4) + circ(cx, cy, 27, { fill: it.c1, stroke: '#8a5a3a', 'stroke-width': 3 })
+        + ln(`M${cx - 18},${cy + 14}Q${cx - 4},${cy + 4} ${cx + 4},${cy - 10}M${cx - 6},${cy + 6}Q${cx + 4},${cy + 6} ${cx + 12},${cy + 2}`, '#6b4a3a', 1.6) + bloss
+        + ln(`M${x},${y + 16}q-3,10 0,18M${x},${y + 16}q3,10 0,18`, it.c2, 1.6);
+    } },
+  { id: 'lantern', name: '红灯笼', c1: '#e0242f', c2: '#f2c75c', grip: 'down', pat: 'none', pc: '#ffffff', tags: ['chinese', 'party', 'fantasy'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      const cy = y + 46;
+      return ln(`M${x},${y}V${cy - 28}`, it.c2, 2) + flat(`M${x - 12},${cy - 30}h24v6h-24z`, it.c2, lineOf(it.c2), 1.4) + ell(x, cy, 28, 24, { fill: it.c1, stroke: lineOf(it.c1), 'stroke-width': 2.2 })
+        + ln(`M${x - 14},${cy - 21}Q${x - 22},${cy} ${x - 14},${cy + 21}M${x},${cy - 24}V${cy + 24}M${x + 14},${cy - 21}Q${x + 22},${cy} ${x + 14},${cy + 21}`, darken(it.c1, .3), 1.4, { opacity: .7 })
+        + flat(`M${x - 12},${cy + 22}h24v6h-24z`, it.c2, lineOf(it.c2), 1.4) + ln(`M${x - 6},${cy + 28}v14M${x},${cy + 28}v16M${x + 6},${cy + 28}v14`, it.c2, 1.6) + ell(x - 10, cy - 8, 5, 9, { fill: '#fff', opacity: .25 });
+    } },
+  { id: 'handbag', name: '小方包', c1: '#ffd1dc', c2: '#ff6f91', grip: 'down', pat: 'none', pc: '#ffffff', tags: ['sweet', 'elegant', 'party', 'cute'],
+    draw: (env, it, at) => {
+      const { x, y } = at;
+      return path(`M${x - 12},${y + 14}Q${x - 12},${y - 8} ${x},${y - 8}Q${x + 12},${y - 8} ${x + 12},${y + 14}`, { fill: 'none', stroke: it.c2, 'stroke-width': 3.4 })
+        + paint(env.ctx, `M${x - 22},${y + 12}h44l-3,34q0,4 -4,4h-30q-4,0 -4,-4z`, it.c1, { pat: it.patUrl, shade: 'tb' }) + bowShape(x, y + 22, 10, 8, it.c2);
+    } },
+);
+
+/* ---------- back items ---------- */
+function wing(s, kind, col) {
+  const X = x => s > 0 ? x : mirX(x);
+  if (kind === 'angel') {
+    let out = '';
+    const lc = mix(lineOf(col), '#b9a6d9', .5);
+    const feather = (ax, ay, ang, L, w, c) => {
+      const d = `M0,${-w / 2}Q${L * .62},${-w * .72} ${L},0Q${L * .62},${w * .72} 0,${w / 2}Z`;
+      return path(d, { fill: c, stroke: lc, 'stroke-width': 1.6, 'stroke-linejoin': 'round', transform: `translate(${r1(X(ax))},${ay}) rotate(${s > 0 ? ang : 180 - ang})` });
+    };
+    const rows = [[-52, 34, 8, 132, 30, '#efe8fb'], [-44, 26, 7, 96, 32, '#f8f4ff'], [-36, 16, 6, 60, 34, '#ffffff']];
+    rows.forEach(([a0, a1, n, L, w, c], ri) => {
+      for (let i = 0; i < n; i++) { const t = i / (n - 1); out += feather(236 + ri * 6, 312 + ri * 4 + t * 26, lerp(a0, a1, t), L * (1 - .22 * t), w, mix(c, col, .5)); }
+    });
+    return out;
+  }
+  if (kind === 'devil') {
+    const pts = [[X(236), 310], [X(300), 250, 1], [X(372), 232, 1], [X(356), 286, 1], [X(338), 272], [X(330), 322, 1], [X(310), 306], [X(296), 352, 1], [X(278), 334], [X(250), 370]];
+    return flat(smooth(pts), col, lineOf(col), 2.4) + ln(`M${X(300)},252L${X(338)},272M${X(300)},252L${X(310)},306M${X(300)},252L${X(278)},334`, lighten(col, .3), 1.6, { opacity: .7 });
+  }
+  if (kind === 'fairy') {
+    const up = [[X(232), 320], [X(276), 236], [X(340), 214], [X(368), 250], [X(340), 300], [X(268), 330]];
+    const lo = [[X(232), 336], [X(300), 352], [X(330), 396], [X(300), 424], [X(262), 398]];
+    const fill = `url(#fairy-${s > 0 ? 'r' : 'l'})`;
+    return flat(smooth(up), col, lineOf(col), 2, { 'fill-opacity': .62 }) + flat(smooth(lo), lighten(col, .2), lineOf(col), 2, { 'fill-opacity': .62 })
+      + ln(`M${X(240)},322Q${X(300)},270 ${X(344)},234M${X(240)},330Q${X(300)},300 ${X(352)},284M${X(240)},340Q${X(290)},370 ${X(312)},404`, '#fff', 1.4, { opacity: .7 })
+      + circ(X(330), 250, 5, { fill: '#fff', opacity: .6 }) + circ(X(306), 390, 4, { fill: '#fff', opacity: .6 });
+  }
+  return '';
+}
+ITEMS.back.push(
+  { id: 'angel', name: '天使翅膀', c1: '#ffffff', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'sweet', 'party', 'elegant'],
+    draw: (env, it) => ({ bgBack: wing(-1, 'angel', it.c1) + wing(1, 'angel', it.c1) }) },
+  { id: 'devil', name: '小恶魔翅膀', c1: '#4a2a5e', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'cool', 'party'],
+    draw: (env, it) => ({ bgBack: wing(-1, 'devil', it.c1) + wing(1, 'devil', it.c1) }) },
+  { id: 'fairy', name: '精灵翅膀', c1: '#9fe3ff', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'nature', 'sweet', 'cute'],
+    draw: (env, it) => ({ bgBack: wing(-1, 'fairy', it.c1) + wing(1, 'fairy', it.c1) }) },
+  { id: 'rucksack', name: '帆布双肩包', c1: '#6b7448', c2: '#6b3f26', pat: 'none', pc: '#ffffff', tags: ['workwear', 'casual', 'vintage', 'nature'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const w = Math.max(K.ch, K.sh) + 14;
+      const body = paint(ctx, `M${CX - w},316Q${CX - w},300 ${CX - w + 16},298H${CX + w - 16}Q${CX + w},300 ${CX + w},316V440Q${CX + w},452 ${CX + w - 12},452H${CX - w + 12}Q${CX - w},452 ${CX - w},440Z`, it.c1, { shade: 'lr' });
+      const strap = s => { const X = d => CX + s * d; return flat(`M${X(K.sh - 22)},302L${X(K.sh - 10)},304L${X(K.ch + 2)},400L${X(K.ch - 8)},402Z`, it.c2, lineOf(it.c2), 1.8) + path(`M${X(K.ch - 6)},356h${s * 12}v8h${-s * 12}z`, { fill: 'none', stroke: '#c9b26a', 'stroke-width': 1.8 }); };
+      return { bgBack: body, accTop: strap(-1) + strap(1) };
+    } },
+  { id: 'guitar', name: '木吉他', c1: '#d9a05a', c2: '#5a3a28', pat: 'none', pc: '#ffffff', tags: ['vintage', 'casual', 'street', 'party'],
+    draw: (env, it) => {
+      const { K } = env;
+      const body = g(flat('M0,-58C24,-58 30,-36 22,-18C40,-6 42,30 24,48C10,62 -10,62 -24,48C-42,30 -40,-6 -22,-18C-30,-36 -24,-58 0,-58Z', it.c1, lineOf(it.c1), 2.4)
+        + circ(0, 0, 11, { fill: '#2a1a14' }) + circ(0, 0, 14, { fill: 'none', stroke: lighten(it.c1, .3), 'stroke-width': 1.6 }) + path('M-12,24h24v6h-24z', { fill: it.c2 })
+        + flat('M-5,-56L-6,-236L6,-236L5,-56Z', it.c2, lineOf(it.c2), 1.8) + ln('M0,-60V-232', '#e8e0cc', .8, { opacity: .8 }) + flat('M-8,-236h16v-30h-16z', it.c2, lineOf(it.c2), 1.8) + [-262, -252, -242].map(y => circ(-10, y, 2, { fill: '#e8e0cc' }) + circ(10, y, 2, { fill: '#e8e0cc' })).join(''), { transform: `translate(${CX - 80},468) rotate(46)` });
+      const strap = ln(`M${CX - K.sh + 12},306L${CX + K.hi},440`, '#3a2a26', 6) + ln(`M${CX - K.sh + 12},306L${CX + K.hi},440`, '#c9374b', 2);
+      return { bgBack: body, accTop: strap };
+    } },
+  { id: 'cape', name: '骑士斗篷', c1: '#8a1f3d', c2: '#f2c75c', pat: 'none', pc: '#ffffff', tags: ['fantasy', 'elegant', 'cool', 'party'],
+    draw: (env, it) => {
+      const { K, ctx } = env;
+      const back = paint(ctx, S([[CX, 290], [CX + K.sh + 8, 304], [CX + K.sh + 30, 380], [CX + K.sh + 46, 560], [CX + K.sh + 50, 664, 1], [CX, 676]]), it.c1, { shade: 'skirt' });
+      const front = flat(`M${CX - K.neck - 8},290Q${CX},304 ${CX + K.neck + 8},290L${CX + K.neck + 6},300Q${CX},314 ${CX - K.neck - 6},300Z`, it.c1, lineOf(it.c1), 2) + circ(CX - K.neck - 4, 300, 5, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1.6 }) + circ(CX + K.neck + 4, 300, 5, { fill: it.c2, stroke: lineOf(it.c2), 'stroke-width': 1.6 }) + ln(`M${CX - K.neck - 4},300Q${CX},310 ${CX + K.neck + 4},300`, it.c2, 1.6);
+      return { bgBack: back, accTop: front };
+    } },
+  { id: 'backbow', name: '后腰大蝴蝶结', c1: '#ff8fab', pat: 'none', pc: '#ffffff', tags: ['sweet', 'cute', 'elegant', 'party'],
+    draw: (env, it) => {
+      const { K } = env;
+      const w = K.hi + 52;
+      const d = smooth([[CX, 420], [CX - w * .6, 386], [CX - w, 396], [CX - w * .95, 446], [CX - w * .55, 444], [CX - 20, 432], [CX - 50, 520, 1], [CX - 30, 512], [CX - 18, 524, 1], [CX, 436], [CX + 18, 524, 1], [CX + 30, 512], [CX + 50, 520, 1], [CX + 20, 432], [CX + w * .55, 444], [CX + w * .95, 446], [CX + w, 396], [CX + w * .6, 386]]);
+      return { bgBack: paint(env.ctx, d, it.c1, { shade: 'rad' }) };
+    } },
+);
+
+/* ---- scenes.js ---- */
+/* ===== scenes.js — backgrounds (viewBox 0 0 400 500) ===== */
+const SCENES = [];
+function sceneDef(id, name, tags, draw) { SCENES.push({ id, name, tags, draw }); }
+const lg = (id, stops, x2 = 0, y2 = 1) => `<linearGradient id="${id}" x1="0" y1="0" x2="${x2}" y2="${y2}">${stops.map(([o, c, a]) => `<stop offset="${o}" stop-color="${c}"${a !== undefined ? ` stop-opacity="${a}"` : ''}/>`).join('')}</linearGradient>`;
+const rg = (id, stops, cx = .5, cy = .5, r = .5) => `<radialGradient id="${id}" cx="${cx}" cy="${cy}" r="${r}">${stops.map(([o, c, a]) => `<stop offset="${o}" stop-color="${c}"${a !== undefined ? ` stop-opacity="${a}"` : ''}/>`).join('')}</radialGradient>`;
+function renderScene(id, P = 'bg', o = {}) {
+  const sc = SCENES.find(s => s.id === id) || SCENES[0];
+  const vb = o.viewBox || '0 0 400 500';
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${vb}" preserveAspectRatio="xMidYMid slice"${o.wh ? ` width="${o.wh[0]}" height="${o.wh[1]}"` : ''}${o.noAnim ? '' : ' class="scene"'}>${sc.draw(P + '-' + sc.id)}</svg>`;
+}
+function sparkles(n, seed, area, col = '#fff', cls = 'tw') {
+  const r = rng(seed); let s = '';
+  for (let i = 0; i < n; i++) {
+    const x = area[0] + r() * area[2], y = area[1] + r() * area[3], sz = 1.5 + r() * 3.5;
+    s += path(starD(x, y, sz, .35, 4), { fill: col, class: cls, style: `animation-delay:${(r() * 3).toFixed(2)}s` });
+  }
+  return s;
+}
+function falling(n, seed, shape, cls = 'fall') {
+  const r = rng(seed); let s = '';
+  for (let i = 0; i < n; i++) {
+    const x = r() * 400, y = r() * 480, d = (6 + r() * 7).toFixed(1), dl = (-r() * 12).toFixed(1);
+    s += `<g class="${cls}" style="animation-duration:${d}s;animation-delay:${dl}s"><g transform="translate(${r1(x)},${r1(y)}) rotate(${Math.round(r() * 360)})">${shape(r)}</g></g>`;
+  }
+  return s;
+}
+const ground = (y, col, line) => path(`M0,${y}Q200,${y - 14} 400,${y}V500H0Z`, { fill: col }) + (line ? ln(`M0,${y}Q200,${y - 14} 400,${y}`, line, 2, { opacity: .5 }) : '');
+const floorGlow = P => `<defs>${rg(P + 'fg', [[0, '#fff', .55], [1, '#fff', 0]])}</defs>` + ell(200, 452, 110, 22, { fill: `url(#${P}fg)` });
+
+sceneDef('dreamy', '梦幻粉', ['cute', 'sweet', 'party', 'fantasy'], P => {
+  let s = `<defs>${lg(P + 'g', [[0, '#cbb6ff'], [.55, '#ffc6e0'], [1, '#ffe8d6']])}</defs><rect width="400" height="500" fill="url(#${P}g)"/>`;
+  const r = rng(3);
+  for (let i = 0; i < 14; i++) s += circ(r() * 400, r() * 380, 16 + r() * 46, { fill: '#fff', opacity: (.08 + r() * .18).toFixed(2), class: 'flt', style: `animation-delay:${(r() * 5).toFixed(1)}s` });
+  s += path('M60,500V250Q60,140 200,140Q340,140 340,250V500', { fill: '#fff', opacity: .22 }) + path('M80,500V256Q80,160 200,160Q320,160 320,256V500', { fill: 'none', stroke: '#fff', 'stroke-width': 3, opacity: .5 });
+  return s + sparkles(26, 9, [0, 0, 400, 420]) + floorGlow(P);
+});
+sceneDef('sakura', '樱花公园', ['nature', 'sweet', 'cute', 'casual', 'summer'], P => {
+  let s = `<defs>${lg(P + 'sky', [[0, '#9fd8ff'], [.7, '#ffe1ee'], [1, '#fff3e8']])}</defs><rect width="400" height="500" fill="url(#${P}sky)"/>`;
+  s += path('M0,360Q90,300 180,350Q280,290 400,340V500H0Z', { fill: '#bfe3c0' }) + path('M0,390Q120,350 240,385Q330,360 400,380V500H0Z', { fill: '#a6d6a6' });
+  const tree = (x, y, sc) => { let t = path(`M${x - 6 * sc},${y}L${x - 3 * sc},${y - 70 * sc}Q${x - 20 * sc},${y - 100 * sc} ${x - 34 * sc},${y - 110 * sc}M${x},${y - 60 * sc}Q${x + 16 * sc},${y - 90 * sc} ${x + 30 * sc},${y - 104 * sc}`, { fill: 'none', stroke: '#8a5a4a', 'stroke-width': 7 * sc, 'stroke-linecap': 'round' }) + path(`M${x - 7 * sc},${y}L${x - 4 * sc},${y - 70 * sc}L${x + 4 * sc},${y - 70 * sc}L${x + 7 * sc},${y}Z`, { fill: '#8a5a4a' }); const r = rng(Math.round(x)); for (let i = 0; i < 9; i++) t += circ(x + (r() - .5) * 110 * sc, y - 110 * sc + (r() - .5) * 60 * sc, (22 + r() * 18) * sc, { fill: i % 3 ? '#ffb7cf' : '#ffd1e1' }); return t; };
+  s += tree(40, 380, 1.1) + tree(370, 370, 1.2) + tree(300, 350, .7);
+  s += ground(440, '#95cf95', '#6aa86a');
+  return s + falling(22, 21, () => path('M0,0q4,-6 8,0q-4,6 -8,0z', { fill: '#ffb7cf' })) + floorGlow(P);
+});
+sceneDef('starry', '星空之夜', ['fantasy', 'cool', 'elegant', 'party', 'winter'], P => {
+  let s = `<defs>${lg(P + 'n', [[0, '#141a46'], [.6, '#3a2f7a'], [1, '#7a4f9e']])}${rg(P + 'm', [[0, '#fff7d6'], [1, '#fff7d6', 0]])}</defs><rect width="400" height="500" fill="url(#${P}n)"/>`;
+  const r = rng(5);
+  for (let i = 0; i < 70; i++) s += circ(r() * 400, r() * 380, .6 + r() * 1.4, { fill: '#fff', class: 'tw', style: `animation-delay:${(r() * 4).toFixed(1)}s` });
+  s += circ(318, 92, 60, { fill: `url(#${P}m)`, opacity: .6 }) + circ(318, 92, 30, { fill: '#fff4c4' }) + circ(330, 84, 26, { fill: '#2a2a66' });
+  s += path('M0,400Q80,340 170,380Q250,330 400,370V500H0Z', { fill: '#2a2457' }) + ground(440, '#1d1a40');
+  return s + sparkles(10, 3, [0, 0, 400, 300], '#fff6c9') + floorGlow(P);
+});
+sceneDef('beach', '夏日海滩', ['summer', 'casual', 'sporty', 'nature'], P => {
+  let s = `<defs>${lg(P + 's', [[0, '#5cc8f2'], [.6, '#bdeeff'], [1, '#fff4d6']])}</defs><rect width="400" height="500" fill="url(#${P}s)"/>`;
+  s += circ(80, 90, 34, { fill: '#fff3a8' }) + circ(80, 90, 50, { fill: '#fff3a8', opacity: .3 });
+  s += path('M0,300H400V400H0Z', { fill: '#3bb3d6' }) + path('M0,300H400V312H0Z', { fill: '#7fd6ee' });
+  for (let y = 322; y < 390; y += 16) s += ln(`M${(y * 7) % 40},${y}q12,-6 24,0t24,0M${(y * 7) % 40 + 140},${y}q12,-6 24,0t24,0M${(y * 7) % 40 + 280},${y}q12,-6 24,0t24,0`, '#fff', 2, { opacity: .6 });
+  s += path('M0,392Q200,370 400,392V500H0Z', { fill: '#f6dfa8' }) + path('M0,392Q100,384 200,390Q300,382 400,392', { fill: 'none', stroke: '#fff', 'stroke-width': 4, opacity: .8 });
+  const palm = `M352,420Q346,340 360,280`;
+  s += ln(palm, '#8a5a3a', 9) + [[-60, 20], [-20, -30], [30, -26], [60, 16], [0, 36]].map(([dx, dy]) => path(`M360,280Q${360 + dx / 2},${280 + dy / 2 - 20} ${360 + dx},${280 + dy}Q${360 + dx / 2},${280 + dy / 2} 360,282Z`, { fill: '#3fa34d', stroke: '#2a7a35', 'stroke-width': 2 })).join('');
+  s += path('M40,412L44,380L90,372L86,404Z', { fill: '#ff6f91', opacity: .9 }) + ln('M60,390L64,440', '#fff', 3);
+  return s + floorGlow(P);
+});
+sceneDef('room', '温馨卧室', ['cute', 'casual', 'sweet', 'winter'], P => {
+  let s = `<defs>${lg(P + 'w', [[0, '#ffe9e1'], [1, '#ffd9cf']])}</defs><rect width="400" height="500" fill="url(#${P}w)"/>`;
+  for (let x = 0; x < 400; x += 28) s += path(`M${x},0h12v380h-12z`, { fill: '#fff', opacity: .35 });
+  s += path('M240,70h120v150h-120z', { fill: '#b8e4ff', stroke: '#fff', 'stroke-width': 8 }) + ln('M300,70V220M240,145H360', '#fff', 5) + circ(330, 110, 12, { fill: '#fff', opacity: .8 });
+  s += path('M226,60Q244,140 230,236L252,236Q246,140 256,60Z', { fill: '#ff9fb6' }) + path('M374,60Q356,140 370,236L348,236Q354,140 344,60Z', { fill: '#ff9fb6' }) + ln('M220,60H380', '#c97a8a', 4);
+  s += path('M40,90h70v56h-70z', { fill: '#fff', stroke: '#e8a7b4', 'stroke-width': 5 }) + circ(75, 118, 14, { fill: '#ffd166' }) + path('M52,138l16,-16l14,10l12,-14l12,20z', { fill: '#7cc37a' });
+  s += path('M0,380H400V500H0Z', { fill: '#d9a77c' }); for (let x = -20; x < 400; x += 46) s += ln(`M${x},380L${x - 30},500`, '#c08a5c', 2);
+  s += ell(200, 455, 150, 30, { fill: '#c7b8ff' }) + ell(200, 455, 130, 22, { fill: 'none', stroke: '#fff', 'stroke-width': 3, 'stroke-dasharray': '6 5' });
+  s += path('M24,380V300q0,-12 14,-12h20q14,0 14,12v80z', { fill: '#8bd17c', stroke: '#5a9a50', 'stroke-width': 2 }) + path('M30,380h36l-4,-34h-28z', { fill: '#e8a07a' });
+  return s + sparkles(8, 4, [0, 0, 400, 300], '#fff');
+});
+sceneDef('city', '霓虹都市', ['street', 'cool', 'party', 'sporty'], P => {
+  let s = `<defs>${lg(P + 'd', [[0, '#2b1a5a'], [.55, '#8a3fa0'], [1, '#ff9a76']])}</defs><rect width="400" height="500" fill="url(#${P}d)"/>`;
+  const r = rng(8);
+  const bld = (x, w, h, c) => { let b = path(`M${x},${400 - h}h${w}V400h${-w}z`, { fill: c }); for (let yy = 400 - h + 12; yy < 390; yy += 16) for (let xx = x + 6; xx < x + w - 8; xx += 12) if (r() > .45) b += path(`M${xx},${yy}h6v8h-6z`, { fill: r() > .5 ? '#ffe28a' : '#8af3ff', opacity: .85 }); return b; };
+  s += bld(-10, 70, 230, '#2a1f4f') + bld(66, 60, 290, '#33275e') + bld(130, 70, 200, '#271d4a') + bld(206, 54, 260, '#33275e') + bld(266, 80, 210, '#2a1f4f') + bld(350, 60, 300, '#33275e');
+  s += path('M80,170h40v18h-40z', { fill: 'none', stroke: '#ff5fa2', 'stroke-width': 3 }) + circ(230, 190, 12, { fill: 'none', stroke: '#5ff3ff', 'stroke-width': 3 }) + path('M290,230l10,-16l10,16z', { fill: 'none', stroke: '#ffe85f', 'stroke-width': 3 });
+  s += path('M0,400H400V500H0Z', { fill: '#1f1838' }) + ln('M0,450H400', '#ff5fa2', 2, { opacity: .4 }) + ln('M0,470H400', '#5ff3ff', 2, { opacity: .3 });
+  return s + floorGlow(P);
+});
+sceneDef('forest', '魔法森林', ['nature', 'fantasy', 'cute', 'autumn'], P => {
+  let s = `<defs>${lg(P + 'f', [[0, '#2f6f6a'], [.6, '#5fa88a'], [1, '#c8e8b0']])}${rg(P + 'ff', [[0, '#fffbb0'], [1, '#fffbb0', 0]])}</defs><rect width="400" height="500" fill="url(#${P}f)"/>`;
+  const tree = (x, h, w, c) => path(`M${x - 5},400V${400 - h * .4}h10V400z`, { fill: '#5a3e2e' }) + path(`M${x},${400 - h}L${x + w},${400 - h * .35}H${x - w}Z`, { fill: c }) + path(`M${x},${400 - h * .8}L${x + w * 1.2},${400 - h * .15}H${x - w * 1.2}Z`, { fill: c });
+  s += tree(30, 300, 40, '#2a5a4e') + tree(120, 240, 34, '#336b58') + tree(300, 280, 38, '#2a5a4e') + tree(380, 250, 36, '#336b58');
+  s += ground(420, '#7cbf6a', '#4f9a4a');
+  const shroom = (x, y, sc, c) => path(`M${x - 4 * sc},${y}v${-12 * sc}h${8 * sc}v${12 * sc}z`, { fill: '#fff4e0' }) + path(`M${x - 14 * sc},${y - 10 * sc}Q${x},${y - 30 * sc} ${x + 14 * sc},${y - 10 * sc}Z`, { fill: c }) + circ(x - 5 * sc, y - 16 * sc, 2 * sc, { fill: '#fff' }) + circ(x + 5 * sc, y - 18 * sc, 1.6 * sc, { fill: '#fff' });
+  s += shroom(60, 440, 1.4, '#e8485f') + shroom(84, 446, 1, '#ff8fab') + shroom(340, 444, 1.3, '#9b6ff0');
+  const r = rng(12);
+  for (let i = 0; i < 16; i++) { const x = r() * 400, y = 120 + r() * 300; s += circ(x, y, 9, { fill: `url(#${P}ff)`, class: 'flt', style: `animation-delay:${(r() * 4).toFixed(1)}s` }) + circ(x, y, 2, { fill: '#fffbb0', class: 'tw', style: `animation-delay:${(r() * 3).toFixed(1)}s` }); }
+  return s + floorGlow(P);
+});
+sceneDef('runway', '时装T台', ['elegant', 'party', 'cool', 'classic'], P => {
+  let s = `<defs>${lg(P + 'c', [[0, '#5a0f2a'], [1, '#2a0716']])}${lg(P + 'sp', [[0, '#fff6d6', .55], [1, '#fff6d6', 0]])}</defs><rect width="400" height="500" fill="url(#${P}c)"/>`;
+  for (let x = 0; x < 400; x += 26) s += path(`M${x},0Q${x + 13},200 ${x},420`, { fill: 'none', stroke: '#7a1a3c', 'stroke-width': 10, opacity: .6 });
+  s += path('M0,0H400V40Q200,70 0,40Z', { fill: '#8a1f3d' }) + ln('M0,40Q200,70 400,40', '#f2c75c', 3);
+  s += path('M130,0L60,440H340L270,0Z', { fill: `url(#${P}sp)`, opacity: .8 });
+  s += path('M0,400H400V500H0Z', { fill: '#1a0610' }) + path('M120,400H280L340,500H60Z', { fill: '#2e2a33' }) + ln('M120,400L60,500M280,400L340,500', '#f2c75c', 2);
+  for (let i = 0; i < 6; i++) { s += circ(120 - i * 11, 410 + i * 18, 2.4, { fill: '#fff6c9', class: 'tw', style: `animation-delay:${i * .3}s` }) + circ(280 + i * 11, 410 + i * 18, 2.4, { fill: '#fff6c9', class: 'tw', style: `animation-delay:${i * .3 + .15}s` }); }
+  return s + sparkles(14, 7, [0, 60, 400, 300], '#ffe9a8');
+});
+sceneDef('snow', '冬日雪景', ['winter', 'cute', 'nature', 'classic'], P => {
+  let s = `<defs>${lg(P + 'w', [[0, '#a9c9f0'], [.7, '#e6f0ff'], [1, '#ffffff']])}</defs><rect width="400" height="500" fill="url(#${P}w)"/>`;
+  const pine = (x, y, sc) => path(`M${x},${y - 120 * sc}L${x + 34 * sc},${y - 60 * sc}H${x + 18 * sc}L${x + 46 * sc},${y}H${x - 46 * sc}L${x - 18 * sc},${y - 60 * sc}H${x - 34 * sc}Z`, { fill: '#3f7a6a' }) + path(`M${x},${y - 120 * sc}L${x + 16 * sc},${y - 92 * sc}Q${x},${y - 84 * sc} ${x - 16 * sc},${y - 92 * sc}Z`, { fill: '#fff' }) + path(`M${x - 4 * sc},${y}h${8 * sc}v${14 * sc}h${-8 * sc}z`, { fill: '#6b4a3a' });
+  s += path('M0,330Q100,290 220,320Q320,290 400,310V500H0Z', { fill: '#dbe8f8' });
+  s += pine(46, 380, 1.3) + pine(110, 360, .8) + pine(330, 370, 1.1) + pine(386, 386, .9);
+  s += ground(420, '#ffffff', '#c6d6ee');
+  return s + falling(40, 31, r => circ(0, 0, 1.4 + r() * 2.6, { fill: '#fff' }), 'fall snowf') + floorGlow(P);
+});
+sceneDef('candy', '糖果乐园', ['cute', 'sweet', 'fantasy', 'party'], P => {
+  let s = `<defs>${lg(P + 'c', [[0, '#bfefff'], [.6, '#ffe0f4'], [1, '#fff3c9']])}</defs><rect width="400" height="500" fill="url(#${P}c)"/>`;
+  const rb = ['#ff9aa2', '#ffcf8a', '#fff2a0', '#b5ead7', '#a0c4ff', '#cdb4ff'];
+  rb.forEach((c, i) => s += path(`M${-20 + i * 9},380A${220 - i * 9},${220 - i * 9} 0 0,1 ${420 - i * 9},380`, { fill: 'none', stroke: c, 'stroke-width': 9, opacity: .7 }));
+  const cloud = (x, y, sc) => g(circ(0, 0, 22) + circ(24, -8, 26) + circ(50, 0, 20) + path('M-22,0h72v16h-72z'), { fill: '#fff', transform: `translate(${x},${y}) scale(${sc})`, class: 'drift' });
+  s += cloud(40, 90, 1) + cloud(270, 60, .8);
+  const lolly = (x, y, c) => ln(`M${x},${y}V${y + 120}`, '#fff', 5) + circ(x, y, 26, { fill: c, stroke: '#fff', 'stroke-width': 4 }) + path(`M${x},${y}m-18,0a18,18 0 0,1 18,-18a12,12 0 0,1 12,12a8,8 0 0,1 -8,8`, { fill: 'none', stroke: '#fff', 'stroke-width': 4 });
+  s += lolly(54, 300, '#ff8fab') + lolly(350, 290, '#7ec4ff') + lolly(310, 340, '#ffd166');
+  s += ground(420, '#ffd1e6', '#ff9fc8');
+  return s + sparkles(16, 6, [0, 0, 400, 380], '#fff') + floorGlow(P);
+});
+sceneDef('campus', '常春藤校园', ['preppy', 'classic', 'vintage', 'autumn', 'office'], P => {
+  let s = `<defs>${lg(P + 's', [[0, '#a8d4f2'], [1, '#f6efe0']])}</defs><rect width="400" height="500" fill="url(#${P}s)"/>`;
+  s += path('M0,120H400V400H0Z', { fill: '#a8513a' });
+  let bricks = '';
+  for (let y = 124; y < 400; y += 10) for (let x = (y / 10) % 2 ? 0 : -12; x < 400; x += 24) bricks += `M${x},${y}h22`;
+  s += ln(bricks, '#8a3f2c', 1, { opacity: .45 }) + path('M0,110H400V124H0Z', { fill: '#e8dcc6' });
+  const win = x => path(`M${x},${300}V200Q${x + 30},170 ${x + 60},200V300Z`, { fill: '#e8f2ff', stroke: '#f3ead6', 'stroke-width': 6 }) + ln(`M${x + 30},180V300M${x},250H${x + 60}`, '#f3ead6', 4);
+  s += win(30) + win(310);
+  const r = rng(14); let ivy = '';
+  for (let i = 0; i < 90; i++) { const side = i % 2 ? 0 : 1; const x = side ? 280 + r() * 120 : r() * 130, y = 110 + r() * 290 * (side ? 1 : .8); ivy += ell(x, y, 6, 4, { fill: r() > .5 ? '#3f7a3a' : '#5a9a48', transform: `rotate(${Math.round(r() * 180)} ${r1(x)} ${r1(y)})` }); }
+  s += ivy + path('M0,400H400V500H0Z', { fill: '#8cc56f' }) + path('M150,400H250L280,500H120Z', { fill: '#d9c9a8' });
+  s += falling(10, 41, () => path('M0,0q5,-7 10,0q-5,7 -10,0z', { fill: '#e8892c' }));
+  return s + floorGlow(P);
+});
+sceneDef('workshop', '复古工坊', ['workwear', 'vintage', 'casual', 'cool'], P => {
+  let s = `<defs>${lg(P + 'w', [[0, '#7a5232'], [1, '#5a3a24']])}${rg(P + 'l', [[0, '#ffe9b0', .7], [1, '#ffe9b0', 0]])}</defs><rect width="400" height="500" fill="url(#${P}w)"/>`;
+  for (let x = 0; x < 400; x += 40) s += ln(`M${x},0V380`, '#4a2e1c', 2, { opacity: .6 });
+  s += path('M40,60h130v100h-130z', { fill: '#c9a87a', stroke: '#4a2e1c', 'stroke-width': 3 });
+  let peg = ''; for (let x = 50; x < 170; x += 14) for (let y = 70; y < 160; y += 14) peg += circ(x, y, 1.4, { fill: '#7a5a3a' }); s += peg;
+  s += ln('M70,80V140M66,80h8', '#8a8f99', 4) + path('M100,78h12v40h-12z', { fill: '#c8433a' }) + ln('M140,76l10,60', '#8a8f99', 4) + circ(150, 140, 7, { fill: 'none', stroke: '#8a8f99', 'stroke-width': 3 });
+  s += path('M240,60h120v70h-120z', { fill: '#2f4e8a', stroke: '#e8d9b8', 'stroke-width': 4 }) + path('M256,84h88M256,100h60', { stroke: '#e8d9b8', 'stroke-width': 5 }) + circ(330, 104, 10, { fill: '#c8433a', stroke: '#e8d9b8', 'stroke-width': 3 });
+  s += circ(200, 30, 90, { fill: `url(#${P}l)` }) + ln('M200,0V24', '#2a1a10', 2) + path('M188,24h24l6,14h-36z', { fill: '#3a4a3a' }) + circ(200, 42, 6, { fill: '#fff3c4' });
+  s += path('M0,380H400V500H0Z', { fill: '#6b5a48' }) + path('M260,300h130v80h-130z', { fill: '#a8774a', stroke: '#4a2e1c', 'stroke-width': 3 }) + path('M250,292h150v12h-150z', { fill: '#c08a5a', stroke: '#4a2e1c', 'stroke-width': 3 });
+  s += path('M20,320h60v60h-60z', { fill: '#c8433a', stroke: '#4a2e1c', 'stroke-width': 3 }) + path('M30,306h40v14h-40z', { fill: '#a33', stroke: '#4a2e1c', 'stroke-width': 3 });
+  return s + floorGlow(P);
+});
+sceneDef('newyear', '新春庙会', ['chinese', 'party', 'winter', 'fantasy'], P => {
+  let s = `<defs>${lg(P + 'r', [[0, '#7a0e1c'], [.6, '#c41f30'], [1, '#ff8a5c']])}</defs><rect width="400" height="500" fill="url(#${P}r)"/>`;
+  const fw = (x, y, c) => { let f = ''; for (let i = 0; i < 12; i++) { const a = i * Math.PI / 6; f += ln(`M${x + Math.cos(a) * 8},${y + Math.sin(a) * 8}L${x + Math.cos(a) * 30},${y + Math.sin(a) * 30}`, c, 2.4); } return g(f, { class: 'tw' }); };
+  s += fw(80, 90, '#ffd166') + fw(320, 70, '#ffb3c8') + fw(240, 150, '#fff3c4');
+  s += path('M0,40Q200,90 400,40', { fill: 'none', stroke: '#3a1a10', 'stroke-width': 2 });
+  for (const [x, y] of [[40, 58], [120, 72], [200, 78], [280, 72], [360, 58]]) s += ln(`M${x},${y - 6}V${y + 6}`, '#3a1a10', 2) + ell(x, y + 26, 20, 18, { fill: '#e0242f', stroke: '#8a1018', 'stroke-width': 2 }) + path(`M${x - 10},${y + 6}h20v4h-20zM${x - 10},${y + 42}h20v4h-20z`, { fill: '#f2c75c' }) + ln(`M${x},${y + 46}v12`, '#f2c75c', 2);
+  s += path('M0,380H400V500H0Z', { fill: '#8a1a24' }) + path('M0,380H400V392H0Z', { fill: '#f2c75c', opacity: .8 });
+  return s + sparkles(20, 17, [0, 0, 400, 360], '#ffe9a8') + floorGlow(P);
+});
+
+indexItems();
+
+if (typeof module !== "undefined") module.exports = { renderCharacter, ITEMS, ITEM_INDEX, HAIRS, BACK_HAIRS, SPECIES, SPECIES_ORDER, EYE_STYLES, EXPRESSIONS, POSES, BODIES, PATTERNS, SCENES, renderScene, makeCtx };

@@ -1,0 +1,4 @@
+[["boy", {"top": {"id": "ocbd"}, "bottom": {"id": "chinos"}, "outer": {"id": "blazer"}, "neck": {"id": "tie"}, "socks": {"id": "argyle"}, "shoes": {"id": "loafer"}}, "boy"],
+ ["girl", {"top": {"id": "blouse"}, "bottom": {"id": "pleated"}, "socks": {"id": "knee"}, "shoes": {"id": "maryjane"}}, "sparkle"],
+ ["boy", {"top": {"id": "chambray"}, "bottom": {"id": "jeans"}, "shoes": {"id": "mocboot"}, "hat": {"id": "beanie"}}, "boy"],
+ ["girl", {"top": {"id": "tee"}, "bottom": {"id": "denimshorts"}, "shoes": {"id": "canvas"}, "hat": {"id": "beret"}, "glasses": {"id": "round"}}, "sparkle"]]
