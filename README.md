@@ -1,6 +1,6 @@
 # 绒绒时装屋 · Fluffy Atelier
 
-给动物人（furry）角色换装的单文件 HTML 小游戏。7 种动物、40 种毛色、148 件单品，男装偏美式复古工装、经典男装和 Ivy 风格，也有中式单品和可爱女装。另有前发 / 后发、3 种体型、5 个姿势、8 种表情、13 个场景、主题挑战（3 位动物评委打分）和拍照导出。
+给动物人（furry）角色换装的单文件 HTML 小游戏。7 种动物、40 种毛色、148 件单品，男装偏美式复古工装、经典男装和 Ivy 风格，也有中式单品和可爱女装。另有博萨诺瓦背景音乐（代码实时合成，没有音频文件）、前发 / 后发、3 种体型、5 个姿势、8 种表情、13 个场景、主题挑战（3 位动物评委打分）和拍照导出。
 
 **在线试玩：** https://grrreymane.github.io/fluffy-atelier/
 
@@ -14,7 +14,7 @@ cp dist/game.html dist/绒绒时装屋.html
 cp dist/game.html index.html   # 在线试玩页（GitHub Pages）
 ```
 
-角色全部由纯 JS 生成 SVG，没有图片素材。`src/` 里按部位分文件：身体和姿势（body.js）、各物种的头（toon.js、species.js）、五官（face.js）、头发（hair.js，描图数据在 hair_data.js）、衣服鞋帽（wear_*.js）、场景（scenes.js）、界面（ui.js、style.css、template.html）。
+角色全部由纯 JS 生成 SVG，没有图片素材。`src/` 里按部位分文件：身体和姿势（body.js）、各物种的头（toon.js、species.js）、五官（face.js）、背景音乐（music.js）、头发（hair.js，描图数据在 hair_data.js）、衣服鞋帽（wear_*.js）、场景（scenes.js）、界面（ui.js、style.css、template.html）。
 
 ## 画法约定
 
@@ -35,5 +35,6 @@ cp dist/game.html index.html   # 在线试玩页（GitHub Pages）
 | `python3 test/stress.py` | 界面里连续点击 600 多次不报错 |
 | `python3 test/migrate.py` | 旧存档能正确迁移 |
 | `python3 test/score.py` | 主题挑战评分 |
+| `python3 test/music.py` | 背景音乐离线渲染一分钟：有声音、不爆音、没有断档（顺便输出 test/out/music.wav 可以听） |
 
 `test/` 里其余脚本是出对照图用的。`tools/trace/` 是把参考发型图描成矢量的工具（工作目录用环境变量 `HAIRTRACE`、`HAIRREF` 指定），`ref/` 是画风参考图。

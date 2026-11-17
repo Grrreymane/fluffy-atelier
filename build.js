@@ -7,7 +7,7 @@ fs.writeFileSync('dist/core.js', core + '\nif (typeof module !== "undefined") mo
 if (fs.existsSync('src/template.html')) {
   let html = fs.readFileSync('src/template.html', 'utf8');
   const css = fs.readFileSync('src/style.css', 'utf8');
-  const ui = fs.existsSync('src/ui.js') ? fs.readFileSync('src/ui.js', 'utf8') : '';
+  const ui = ['music', 'ui'].filter(exist).map(f => fs.readFileSync(`src/${f}.js`, 'utf8')).join('\n');
   html = html.replace('/*__CSS__*/', () => css).replace('/*__JS__*/', () => core + '\n' + ui);
   fs.writeFileSync('dist/game.html', html);
   console.log('game.html', (html.length / 1024).toFixed(1) + 'KB');

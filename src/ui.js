@@ -12,6 +12,8 @@ const ICO = {
   undo: sv('<path d="M8 5L4 9l4 4"/><path d="M4 9h10a6 6 0 0 1 0 12H9"/>'),
   dice: sv('<rect x="3.5" y="3.5" width="17" height="17" rx="4"/><circle cx="8.5" cy="8.5" r="1.3" fill="currentColor"/><circle cx="15.5" cy="15.5" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="15.5" cy="8.5" r="1.3" fill="currentColor"/><circle cx="8.5" cy="15.5" r="1.3" fill="currentColor"/>'),
   soundOn: sv('<path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>'),
+  musicOn: sv('<path d="M9 18V5l11-2v13"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="16" r="2.5"/>'),
+  musicOff: sv('<path d="M9 18V5l11-2v13"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="16" r="2.5"/><path d="M3 3l18 18"/>'),
   soundOff: sv('<path d="M4 9v6h4l5 4V5L8 9z"/><path d="M17 9l5 6M22 9l-5 6"/>'),
   camera: sv('<path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.6"/>'),
   sparkle: sv('<path d="M12 3c.8 4.6 2.4 6.2 7 7-4.6.8-6.2 2.4-7 7-.8-4.6-2.4-6.2-7-7 4.6-.8 6.2-2.4 7-7z" fill="currentColor" stroke="none"/><path d="M19 15.5c.3 1.6.9 2.2 2.5 2.5-1.6.3-2.2.9-2.5 2.5-.3-1.6-.9-2.2-2.5-2.5 1.6-.3 2.2-.9 2.5-2.5z" fill="currentColor" stroke="none"/>'),
@@ -181,11 +183,11 @@ function load() {
   } catch (e) { return null; }
 }
 let saveT = 0;
-function save() { clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(STORE, JSON.stringify(S)); localStorage.setItem(STORE + '-ui', JSON.stringify({ sound: UI.sound })); } catch (e) { /* storage unavailable: play on without saving */ } }, 250); }
+function save() { clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(STORE, JSON.stringify(S)); localStorage.setItem(STORE + '-ui', JSON.stringify({ sound: UI.sound, music: UI.music })); } catch (e) { /* storage unavailable: play on without saving */ } }, 250); }
 
 let S = load() || defaultState();
-const UI = { group: 'wear', cat: 'top', target: 'c1', fur: 'main', challenge: null, sound: true, collapsed: false };
-try { const u = JSON.parse(localStorage.getItem(STORE + '-ui') || '{}'); if (typeof u.sound === 'boolean') UI.sound = u.sound; } catch (e) { /* ignore */ }
+const UI = { group: 'wear', cat: 'top', target: 'c1', fur: 'main', challenge: null, sound: true, music: true, collapsed: false };
+try { const u = JSON.parse(localStorage.getItem(STORE + '-ui') || '{}'); if (typeof u.sound === 'boolean') UI.sound = u.sound; if (typeof u.music === 'boolean') UI.music = u.music; } catch (e) { /* ignore */ }
 const undoStack = [];
 
 function commit(fn, o = {}) {
@@ -234,6 +236,8 @@ const SFX = {
   ding: () => { tone(1318, 0, .35, 'sine', .12); tone(1976, .02, .3, 'sine', .05); },
 };
 function play(n) { if (UI.sound) try { SFX[n](); } catch (e) { /* audio blocked */ } }
+/* background music (music.js): browsers only allow sound after a tap, so it starts on the first one */
+function music(on) { try { if (on) BGM.start(ac()); else BGM.stop(); } catch (e) { /* audio blocked */ } }
 function buzz() { if (navigator.vibrate) try { navigator.vibrate(8); } catch (e) { /* ignore */ } }
 
 /* ---------- stage ---------- */
@@ -664,7 +668,7 @@ function submitChallenge() {
       c.querySelectorAll('.stars .on').forEach((el, i) => el.style.animationDelay = (1.1 + i * .15) + 's');
     });
   });
-  play('fanfare');
+  play('fanfare'); BGM.duck(3);
   if (r.total >= 65) confetti(r.total >= 90 ? 90 : 50);
 }
 function countUp(el, to, dec, ms) {
@@ -720,7 +724,7 @@ async function makePhoto(name) {
   return cv.toDataURL('image/png');
 }
 async function openPhoto() {
-  play('shutter');
+  play('shutter'); BGM.duck(2);
   const flash = document.createElement('div');
   flash.style.cssText = 'position:fixed;inset:0;background:#fff;z-index:80;opacity:.9;transition:opacity .45s;pointer-events:none';
   document.body.appendChild(flash);
@@ -759,6 +763,10 @@ function bind() {
   $('#btnUndo').onclick = undo;
   $('#btnRandom').onclick = randomize;
   $('#btnSound').onclick = () => { UI.sound = !UI.sound; setSound(); save(); if (UI.sound) play('ding'); };
+  const setMusic = () => { $('#btnMusic').innerHTML = UI.music ? ICO.musicOn : ICO.musicOff; $('#btnMusic').setAttribute('aria-pressed', UI.music); };
+  setMusic();
+  $('#btnMusic').onclick = () => { UI.music = !UI.music; setMusic(); save(); music(UI.music); };
+  document.addEventListener('visibilitychange', () => { if (UI.music) music(!document.hidden); });
   $('#btnPhoto').onclick = openPhoto;
   $('#btnPresets').onclick = openPresets;
   $('#btnChallenge').onclick = () => UI.challenge ? submitChallenge() : openChallenge();
@@ -806,7 +814,7 @@ function bind() {
     if (e.key === 'Escape' && !$('#modal').hidden) closeModal();
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && $('#modal').hidden) { e.preventDefault(); undo(); }
   });
-  document.addEventListener('pointerdown', () => ac(), { once: true });
+  document.addEventListener('pointerdown', () => { ac(); if (UI.music) music(true); }, { once: true });
 }
 
 /* ---------- boot ---------- */

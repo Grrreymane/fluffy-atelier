@@ -6,3 +6,4 @@ __pycache__/
 .DS_Store
 pub/
 1gp-kit/frames/
+test/out/
