@@ -213,7 +213,7 @@ function drawHair(env, add) {
   let cut = null, cutInk = '';
   if (hat && hat.covers) {
     const y0 = HAIR_CUT + 14, w = skullX(H.kind, y0) - 200 + 1;
-    const edge = `M${r1(200 - w - 70)},${y0 + 70}L${r1(200 - w)},${y0}L${r1(200 + w)},${y0}L${r1(200 + w + 70)},${y0 + 70}`;
+    const edge = `M${r1(200 - w - 34)},${y0 + 90}L${r1(200 - w)},${y0}L${r1(200 + w)},${y0}L${r1(200 + w + 34)},${y0 + 90}`;
     cut = ctx.clip(edge + 'L700,1400L-300,1400Z');
     const D = HAIR_TRACE[st.hair.id];
     if (D) { const wp = warpTo(H); cutInk = g(ln(edge, F.line, 5.2), { 'clip-path': ctx.clipAll(D.outer.map(q => smooth(q.map(wp)))) }); }
