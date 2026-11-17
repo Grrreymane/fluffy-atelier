@@ -2,13 +2,16 @@
 
 给动物人（furry）角色换装的单文件 HTML 小游戏。7 种动物、40 种毛色、148 件单品，男装偏美式复古工装、经典男装和 Ivy 风格，也有中式单品和可爱女装。另有前发 / 后发、3 种体型、5 个姿势、8 种表情、13 个场景、主题挑战（3 位动物评委打分）和拍照导出。
 
-**直接玩：** 打开 `dist/绒绒时装屋.html`（不需要服务器，手机和电脑都能用）。
+**在线试玩：** https://grrreymane.github.io/fluffy-atelier/
+
+也可以下载 `dist/绒绒时装屋.html` 直接打开（不需要服务器，手机和电脑都能用）。
 
 ## 构建
 
 ```sh
 node build.js        # src/ → dist/core.js 和 dist/game.html
 cp dist/game.html dist/绒绒时装屋.html
+cp dist/game.html index.html   # 在线试玩页（GitHub Pages）
 ```
 
 角色全部由纯 JS 生成 SVG，没有图片素材。`src/` 里按部位分文件：身体和姿势（body.js）、各物种的头（toon.js、species.js）、五官（face.js）、头发（hair.js，描图数据在 hair_data.js）、衣服鞋帽（wear_*.js）、场景（scenes.js）、界面（ui.js、style.css、template.html）。
