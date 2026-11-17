@@ -813,6 +813,7 @@ function bind() {
 bind();
 renderGroups();
 refresh({});
+/*TRAILER_HOOK*/
 (() => {
   const c = $('#curtain');
   const reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;

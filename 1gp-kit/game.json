@@ -1,0 +1,12 @@
+{
+  "title": "绒绒时装屋",
+  "description": "给毛茸茸的动物人换装！7 种动物、40 种毛色、148 件单品：美式复古工装、经典男装、Ivy 学院风，也有旗袍唐装和可爱洛丽塔。前发后发、3 种体型、5 个姿势、8 种表情、13 个场景随你搭。玩「主题挑战」，狐狸主编、熊熊裁缝、猫咪超模三位评委给你打分；搭好了拍一张拍立得留念。手机电脑都能玩，角色全部是矢量绘制。",
+  "genre": "casual",
+  "tags": ["换装", "毛茸茸", "动物人", "时尚搭配", "拍立得"],
+  "maker": { "tools": ["Claude"], "orientation": "portrait", "session": "short" },
+  "release": { "version": "1.0.0", "title": "首发", "notes": "首发：7 种动物、148 件单品、13 个场景，主题挑战三位评委打分，拍立得导出。" },
+  "cover": "1gp-kit/cover.png",
+  "coverBase": "1gp-kit/cover-base.png",
+  "preview": "1gp-kit/preview.mp4",
+  "screenshots": ["1gp-kit/shots/01-main.png", "1gp-kit/shots/02-wardrobe.png", "1gp-kit/shots/03-presets.png", "1gp-kit/shots/04-score.png", "1gp-kit/shots/05-photo.png"]
+}
