@@ -35,6 +35,7 @@ cp dist/game.html index.html   # 在线试玩页（GitHub Pages）
 | `python3 test/stress.py` | 界面里连续点击 600 多次不报错 |
 | `python3 test/migrate.py` | 旧存档能正确迁移 |
 | `python3 test/score.py` | 主题挑战评分 |
+| `python3 test/music_start.py` | 按 Chrome 真实的自动播放限制，第一次点击 / 触摸 / 按键后音乐就开始播 |
 | `python3 test/music.py` | 背景音乐离线渲染一分钟：有声音、不爆音、没有断档（顺便输出 test/out/music.wav 可以听） |
 
 `test/` 里其余脚本是出对照图用的。`tools/trace/` 是把参考发型图描成矢量的工具（工作目录用环境变量 `HAIRTRACE`、`HAIRREF` 指定），`ref/` 是画风参考图。

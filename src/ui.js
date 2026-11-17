@@ -766,7 +766,8 @@ function bind() {
   const setMusic = () => { $('#btnMusic').innerHTML = UI.music ? ICO.musicOn : ICO.musicOff; $('#btnMusic').setAttribute('aria-pressed', UI.music); };
   setMusic();
   $('#btnMusic').onclick = () => { UI.music = !UI.music; setMusic(); save(); music(UI.music); };
-  document.addEventListener('visibilitychange', () => { if (UI.music) music(!document.hidden); });
+  // only once audio has been unlocked: a context made here, with no gesture, would start suspended
+  document.addEventListener('visibilitychange', () => { if (UI.music && BGM.context) music(!document.hidden); });
   $('#btnPhoto').onclick = openPhoto;
   $('#btnPresets').onclick = openPresets;
   $('#btnChallenge').onclick = () => UI.challenge ? submitChallenge() : openChallenge();
@@ -814,7 +815,17 @@ function bind() {
     if (e.key === 'Escape' && !$('#modal').hidden) closeModal();
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && $('#modal').hidden) { e.preventDefault(); undo(); }
   });
-  document.addEventListener('pointerdown', () => { ac(); if (UI.music) music(true); }, { once: true });
+  /* unlock audio on the first real gesture. Browsers differ in which events count (Safari ignores pointerdown,
+     a key press counts too), and a context created on an event that doesn't count stays suspended: so keep
+     listening on all of them until the context is actually running, and start the music then */
+  const UNLOCK = ['pointerdown', 'pointerup', 'click', 'touchend', 'keydown'];
+  const unlock = () => {
+    const a = ac(); if (!a) return;
+    if (UI.music) music(true);
+    const done = () => { if (a.state === 'running') UNLOCK.forEach(ev => document.removeEventListener(ev, unlock, true)); };
+    done(); if (a.resume) a.resume().then(done, () => {});
+  };
+  UNLOCK.forEach(ev => document.addEventListener(ev, unlock, true));
 }
 
 /* ---------- boot ---------- */

@@ -131,7 +131,7 @@ const BGM = (() => {
   }
   function start(a) {
     if (!a) return;
-    if (!ac) { ac = a; graph(); }
+    if (!ac) { ac = a; graph(); ac.addEventListener && ac.addEventListener('statechange', () => { if (on && ac.state === 'running') { next = Math.max(next, ac.currentTime + .05); fade(VOL, .8); } }); }
     if (on) return;
     on = true;
     next = Math.max(next, ac.currentTime + .1);
@@ -156,5 +156,5 @@ const BGM = (() => {
     while (next < sec) { scheduleBar(next, step); next += BAR; step++; if (step >= BARS) { step = 0; pass++; } }
     return offline.startRendering();
   }
-  return { start, stop, duck, renderTo, get playing() { return on; } };
+  return { start, stop, duck, renderTo, get playing() { return on; }, get context() { return ac; } };
 })();
