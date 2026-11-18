@@ -37,7 +37,7 @@ for (const t of found) {
   if (SKIP.has(t)) continue;
   const k = key(t); zh[k] = t;
   const w = width(t);
-  limits[k] = w <= 4 ? 12 : w <= 12 ? Math.round(w * 2.6) : Math.round(w * 2.2);
+  limits[k] = w <= 4 ? 16 : w <= 12 ? Math.max(20, Math.round(w * 3.2)) : Math.round(w * 2.8);
 }
 fs.mkdirSync(OUT, { recursive: true });
 fs.writeFileSync(path.join(OUT, 'zh.json'), JSON.stringify(zh, null, 1) + '\n');
