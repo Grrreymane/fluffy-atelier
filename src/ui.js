@@ -327,7 +327,7 @@ function tilesFor(cat) {
       const ctxk = (C.ctx || []).map(k => JSON.stringify(S.wear[k] || '')).join('|');
       return { id: it.id, name: it.name, sel: !!(S.wear[slot] && S.wear[slot].id === it.id) && !hiddenByDress(slot), key: furKey + JSON.stringify(cur) + ctxk + (slot === 'hat' || slot === 'glasses' || slot === 'face' ? JSON.stringify(S.hair) + JSON.stringify(S.eyes) + S.expr : ''), svg: () => itemThumb(cat, it.id) };
     });
-    if (C.optional) list.unshift({ id: '', name: '不穿戴', none: true, sel: !S.wear[slot] || hiddenByDress(slot), key: 'none' });
+    if (C.optional) list.unshift({ id: '', name: L('不穿戴'), none: true, sel: !S.wear[slot] || hiddenByDress(slot), key: 'none' });
     return list;
   }
   switch (cat) {
@@ -379,7 +379,7 @@ function renderItems() {
     if (t.off) n.setAttribute('aria-disabled', 'true'); else n.removeAttribute('aria-disabled');
     if (n.dataset.k !== t.key) {
       n.dataset.k = t.key;
-      if (t.none) { n.firstElementChild.innerHTML = '<span>无</span>'; return; }
+      if (t.none) { n.firstElementChild.innerHTML = '<span>' + L('无') + '</span>'; return; }
       thumbFns.set(n, t.svg);
       if (thumbIO) { thumbIO.unobserve(n); thumbIO.observe(n); } else paintTile(n);
     }
@@ -388,10 +388,10 @@ function renderItems() {
 
 /* ---------- editor ---------- */
 function spool(col, on, i) {
-  return `<button class="spool" data-col="${col}" aria-pressed="${on}" aria-label="颜色 ${col}" style="--c:${col}"><svg viewBox="0 0 26 38"><rect x="1" y="1" width="24" height="5.5" rx="2.2" fill="#e8c79a" stroke="#a9824f" stroke-width="1.2"/><rect x="4" y="6.5" width="18" height="25" fill="${col}"/><path d="M4 10.5h18M4 14.5h18M4 18.5h18M4 22.5h18M4 26.5h18" stroke="${lineOf(col)}" stroke-opacity=".25" stroke-width="1"/><rect x="6" y="6.5" width="3" height="25" fill="#fff" opacity=".28"/><rect x="4" y="6.5" width="18" height="25" fill="none" stroke="${lineOf(col)}" stroke-opacity=".5" stroke-width="1"/><rect x="1" y="31.5" width="24" height="5.5" rx="2.2" fill="#e8c79a" stroke="#a9824f" stroke-width="1.2"/></svg></button>`;
+  return `<button class="spool" data-col="${col}" aria-pressed="${on}" aria-label="${L('颜色')} ${col}" style="--c:${col}"><svg viewBox="0 0 26 38"><rect x="1" y="1" width="24" height="5.5" rx="2.2" fill="#e8c79a" stroke="#a9824f" stroke-width="1.2"/><rect x="4" y="6.5" width="18" height="25" fill="${col}"/><path d="M4 10.5h18M4 14.5h18M4 18.5h18M4 22.5h18M4 26.5h18" stroke="${lineOf(col)}" stroke-opacity=".25" stroke-width="1"/><rect x="6" y="6.5" width="3" height="25" fill="#fff" opacity=".28"/><rect x="4" y="6.5" width="18" height="25" fill="none" stroke="${lineOf(col)}" stroke-opacity=".5" stroke-width="1"/><rect x="1" y="31.5" width="24" height="5.5" rx="2.2" fill="#e8c79a" stroke="#a9824f" stroke-width="1.2"/></svg></button>`;
 }
 function customSpool(cur) {
-  return `<label class="spool custom" aria-label="自定义颜色"><svg viewBox="0 0 26 38"><defs><linearGradient id="rbw" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#ff6f91"/><stop offset=".3" stop-color="#ffd56b"/><stop offset=".6" stop-color="#7cc37a"/><stop offset="1" stop-color="#7b5cd6"/></linearGradient></defs><rect x="1" y="1" width="24" height="5.5" rx="2.2" fill="#e8c79a" stroke="#a9824f" stroke-width="1.2"/><rect x="4" y="6.5" width="18" height="25" fill="url(#rbw)"/><path d="M13 13v12M7 19h12" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/><rect x="1" y="31.5" width="24" height="5.5" rx="2.2" fill="#e8c79a" stroke="#a9824f" stroke-width="1.2"/></svg><input type="color" value="${cur}" data-custom="1"></label>`;
+  return `<label class="spool custom" aria-label="${L('自定义颜色')}"><svg viewBox="0 0 26 38"><defs><linearGradient id="rbw" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#ff6f91"/><stop offset=".3" stop-color="#ffd56b"/><stop offset=".6" stop-color="#7cc37a"/><stop offset="1" stop-color="#7b5cd6"/></linearGradient></defs><rect x="1" y="1" width="24" height="5.5" rx="2.2" fill="#e8c79a" stroke="#a9824f" stroke-width="1.2"/><rect x="4" y="6.5" width="18" height="25" fill="url(#rbw)"/><path d="M13 13v12M7 19h12" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/><rect x="1" y="31.5" width="24" height="5.5" rx="2.2" fill="#e8c79a" stroke="#a9824f" stroke-width="1.2"/></svg><input type="color" value="${cur}" data-custom="1"></label>`;
 }
 function pinked(id, fill, patType, pc) {
   const pts = [];
@@ -412,24 +412,24 @@ function renderEditor() {
   if (C.slot && S.wear[C.slot] && !hiddenByDress(C.slot)) {
     const it = itemOf(C.slot, S.wear[C.slot]);
     const def = it.def;
-    const targets = [['c1', '主色']];
-    if (def.c2) targets.push(['c2', '配色']);
-    if (C.pattern) targets.push(['pat', '图案']);
-    if (C.pattern && it.pat !== 'none') targets.push(['pc', '图案色']);
+    const targets = [['c1', L('主色')]];
+    if (def.c2) targets.push(['c2', L('配色')]);
+    if (C.pattern) targets.push(['pat', L('图案')]);
+    if (C.pattern && it.pat !== 'none') targets.push(['pc', L('图案色')]);
     if (!targets.find(t => t[0] === UI.target)) UI.target = 'c1';
     html += `<div class="ed-row"><div class="seg" role="group">${targets.map(([k, n]) => `<button data-t="${k}" aria-pressed="${UI.target === k}">${n}</button>`).join('')}</div>`;
-    if (C.tuck && !S.wear.dress) html += `<button class="toggle" data-tuck="1" aria-pressed="${!!it.tuck}"><i></i>塞进下装</button>`;
+    if (C.tuck && !S.wear.dress) html += `<button class="toggle" data-tuck="1" aria-pressed="${!!it.tuck}"><i></i>${L('塞进下装')}</button>`;
     html += `</div>`;
     if (UI.target === 'pat') html += `<div class="ed-row"><div class="fabrics">${PATTERNS.map(p => `<button class="fabric" data-pat="${p.id}" aria-pressed="${it.pat === p.id}" title="${p.name}" aria-label="${p.name}">${pinked('pk-' + p.id, it.c1, p.id, it.pc)}</button>`).join('')}</div></div>`;
     else html += `<div class="ed-row">${spools(SWATCHES, it[UI.target])}</div>`;
   } else if (UI.cat === 'fur' || UI.cat === 'species') {
-    const targets = [['main', '主色'], ['sub', '副色'], ['acc', '点缀']];
+    const targets = [['main', L('主色')], ['sub', L('副色')], ['acc', L('点缀')]];
     html += `<div class="ed-row"><div class="seg" role="group">${targets.map(([k, n]) => `<button data-f="${k}" aria-pressed="${UI.fur === k}">${n}</button>`).join('')}</div></div>`;
     html += `<div class="ed-row">${spools(FUR_SWATCHES, S.fur[UI.fur])}</div>`;
   } else if (UI.cat === 'eyes') {
-    html += `<div class="ed-row"><span class="ed-label">瞳色</span>${spools(EYE_COLORS, S.eyes.color)}</div>`;
+    html += `<div class="ed-row"><span class="ed-label">${L('瞳色')}</span>${spools(EYE_COLORS, S.eyes.color)}</div>`;
   } else if (UI.cat === 'backHair' && S.hair.id === 'none') {
-    html += `<div class="ed-row"><span class="ed-hint">后发要搭配前发才能选</span><button class="pill" data-go="hair">去选前发</button></div>`;
+    html += `<div class="ed-row"><span class="ed-hint">${L('后发要搭配前发才能选')}</span><button class="pill" data-go="hair">${L('去选前发')}</button></div>`;
   }
   if (el.dataset.k !== html) { el.innerHTML = html; el.dataset.k = html; }
 }
@@ -459,7 +459,7 @@ function selectTile(id) {
     case 'expr': commit(s => { s.expr = id; }, { fx: 'expr' }); break;
     case 'hair': commit(s => { s.hair.id = id; if (id === 'none') s.backHair = { id: 'none' }; }, { fx: 'hair' }); break;
     case 'backHair':
-      if (id !== 'none' && S.hair.id === 'none') { toast('先选一款前发，才能搭配后发'); play('tap'); return; }
+      if (id !== 'none' && S.hair.id === 'none') { toast(L('先选一款前发，才能搭配后发')); play('tap'); return; }
       if (S.backHair.id === id) { play('tap'); return; }
       commit(s => { s.backHair = { id }; }, { fx: 'backHair' }); break;
     case 'pose': commit(s => { s.pose = id; }, { fx: 'pose' }); break;
@@ -467,7 +467,9 @@ function selectTile(id) {
   }
   play('pop'); buzz();
 }
-function renameFor(s, sp) { if (!s.name || Object.values(DEFAULT_NAMES).includes(s.name)) s.name = DEFAULT_NAMES[sp]; }
+/* default names in every language: switching species renames a default-named character, whatever language named it */
+const DEFAULT_NAME_FORMS = new Set();
+function renameFor(s, sp) { if (!s.name || DEFAULT_NAME_FORMS.has(s.name)) s.name = DEFAULT_NAMES[sp]; }
 function remember(s, slot) { const w = s.wear[slot]; if (!w) return; s.mem[slot] = s.mem[slot] || {}; const { id, ...rest } = w; if (Object.keys(rest).length) s.mem[slot][id] = rest; }
 function setColor(col) {
   const C = CAT[UI.cat];
@@ -526,7 +528,7 @@ function randomize() {
 /* ---------- modal helpers ---------- */
 function openModal(html, onReady) {
   const m = $('#modal'), c = $('#modalCard');
-  c.innerHTML = `<button class="m-close" data-close="1" aria-label="关闭">×</button>` + html;
+  c.innerHTML = `<button class="m-close" data-close="1" aria-label="${L('关闭')}">×</button>` + html;
   m.hidden = false;
   if (onReady) onReady(c);
   const f = c.querySelector('[data-focus]') || c.querySelector('button:not(.m-close)');
@@ -541,13 +543,13 @@ function openPresets() {
     const st = Object.assign(clone(S), { wear: clone(p.wear), pose: p.pose });
     return `<button class="preset" data-preset="${i}"><div class="pv">${renderScene(p.bg, 'pp' + i, { noAnim: true })}${renderCharacter(st, { id: 'pc' + i, noAnim: true })}</div><b>${p.name}</b><small>${p.sub}</small></button>`;
   }).join('');
-  openModal(`<h2 class="m-title">穿搭灵感</h2><p class="m-sub">点一套直接换上，保留你现在的角色和毛色</p><div class="preset-grid">${cards}</div>`);
+  openModal(`<h2 class="m-title">${L('穿搭灵感')}</h2><p class="m-sub">${L('点一套直接换上，保留你现在的角色和毛色')}</p><div class="preset-grid">${cards}</div>`);
   play('swish');
 }
 function applyPreset(i) {
   const p = PRESETS[i];
   commit(s => { s.wear = clone(p.wear); s.bg = p.bg; s.pose = p.pose; }, { fx: 'top' });
-  closeModal(); play('ding'); toast(`换上了「${p.name}」`);
+  closeModal(); play('ding'); toast(L('换上了「{0}」', p.name));
   sparkleAt([200, 300], 10); sparkleAt([200, 560], 8);
 }
 
@@ -557,22 +559,22 @@ function openChallenge() {
   UI.pending = t;
   const tags = Object.entries(t.want).sort((a, b) => b[1] - a[1]).map(([k]) => `<span class="chip">${TAG_NAME[k] || k}</span>`).join('');
   const sc = t.bgs.map(b => `<span class="chip scene">${SCENES.find(x => x.id === b).name}</span>`).join('');
-  openModal(`<h2 class="m-title">主题挑战</h2><p class="m-sub">按主题搭一套，三位评委会给你打分</p>
+  openModal(`<h2 class="m-title">${L('主题挑战')}</h2><p class="m-sub">${L('按主题搭一套，三位评委会给你打分')}</p>
     <div class="theme-card"><div class="tt">${t.name}</div><p>${t.desc}</p><div class="chips">${tags}</div><div class="chips">${sc}</div></div>
-    <div class="m-actions"><button class="pill" data-reroll="1">换个主题</button><button class="pill cherry" data-start="1" data-focus="1">开始搭配</button></div>`);
+    <div class="m-actions"><button class="pill" data-reroll="1">${L('换个主题')}</button><button class="pill cherry" data-start="1" data-focus="1">${L('开始搭配')}</button></div>`);
   play('swish');
 }
 function setChallengeUI() {
   const on = !!UI.challenge;
   $('#quest').hidden = !on; $('#brandTitle').hidden = on;
   if (on) $('#questTitle').textContent = UI.challenge.name;
-  $('#chLabel').textContent = on ? '提交评分' : '主题挑战';
+  $('#chLabel').textContent = on ? L('提交评分') : L('主题挑战');
   $('#btnChallenge').classList.toggle('go', on);
 }
 function startChallenge() {
   UI.challenge = UI.pending;
   setChallengeUI();
-  closeModal(); play('ding'); toast('搭好了就点右下角「提交评分」');
+  closeModal(); play('ding'); toast(L('搭好了就点右下角「提交评分」'));
 }
 function quitChallenge() { UI.challenge = null; setChallengeUI(); }
 
@@ -637,29 +639,29 @@ function submitChallenge() {
   const t = UI.challenge; if (!t) return;
   const r = evaluate(t);
   const scores = JUDGES.map(j => clamp(Math.round((j.score(r) * 10 + (Math.random() - .5) * .6) * 10) / 10, 2, 10));
-  const grade = r.total >= 90 ? 'S · 时尚教主' : r.total >= 80 ? 'A · 潮流达人' : r.total >= 65 ? 'B · 搭配新星' : r.total >= 50 ? 'C · 继续加油' : 'D · 再试一次';
+  const grade = r.total >= 90 ? 'S · ' + L('时尚教主') : r.total >= 80 ? 'A · ' + L('潮流达人') : r.total >= 65 ? 'B · ' + L('搭配新星') : r.total >= 50 ? 'C · ' + L('继续加油') : 'D · ' + L('再试一次');
   const stars = r.total >= 90 ? 5 : r.total >= 80 ? 4 : r.total >= 65 ? 3 : r.total >= 50 ? 2 : 1;
-  const c1 = scores[0] >= 7 ? (r.good.length ? `「${r.good[0].def.name}」完美切题！` : '主题抓得很准！') : (r.good.length ? `「${r.good[0].def.name}」不错，其他单品再贴题一点。` : '主题感还可以再强一点。');
-  const c1b = r.bad.length ? `「${r.bad[0].def.name}」有点跑题。` : '';
-  const c2 = !r.hasOutfit ? '整套衣服还没穿齐哦。' : !S.wear.shoes ? '鞋子别忘了！' : r.harm > .85 ? '配色很和谐，针脚都对齐了。' : '颜色有点多，试试统一色调？';
-  const c3 = scores[2] >= 7 ? '镜头感十足，可以直接上杂志！' : r.flair > .6 ? '配饰很出彩，可惜和主题不太搭。' : r.accN === 0 ? '空空的，加点配饰吧～' : '再加一两件配饰会更出彩。';
+  const c1 = scores[0] >= 7 ? (r.good.length ? L('「{0}」完美切题！', r.good[0].def.name) : L('主题抓得很准！')) : (r.good.length ? L('「{0}」不错，其他单品再贴题一点。', r.good[0].def.name) : L('主题感还可以再强一点。'));
+  const c1b = r.bad.length ? L('「{0}」有点跑题。', r.bad[0].def.name) : '';
+  const c2 = !r.hasOutfit ? L('整套衣服还没穿齐哦。') : !S.wear.shoes ? L('鞋子别忘了！') : r.harm > .85 ? L('配色很和谐，针脚都对齐了。') : L('颜色有点多，试试统一色调？');
+  const c3 = scores[2] >= 7 ? L('镜头感十足，可以直接上杂志！') : r.flair > .6 ? L('配饰很出彩，可惜和主题不太搭。') : r.accN === 0 ? L('空空的，加点配饰吧～') : L('再加一两件配饰会更出彩。');
   const tips = [];
-  if (r.sceneOk < 1) tips.push(`换成「${SCENES.find(x => x.id === t.bgs[0]).name}」背景会更有氛围。`);
+  if (r.sceneOk < 1) tips.push(L('换成「{0}」背景会更有氛围。', SCENES.find(x => x.id === t.bgs[0]).name));
   const sug = [];
   for (const slot of ['dress', 'top', 'bottom', 'outer', 'shoes', 'hat', 'neck', 'held']) {
     const best = ITEMS[slot].map(it => ({ it, s: it.tags.reduce((a, tg) => a + (t.want[tg] || 0), 0) - (it.tags.some(tg => t.avoid.includes(tg)) ? 9 : 0) })).sort((a, b) => b.s - a.s)[0];
     if (best && best.s >= 4 && !(S.wear[slot] && S.wear[slot].id === best.it.id)) sug.push(best.it.name);
   }
-  if (sug.length) tips.push(`可以试试：${sug.slice(0, 3).join('、')}。`);
+  if (sug.length) tips.push(L('可以试试：{0}。', sug.slice(0, 3).join(LIST_SEP)));
   const tick = [0, 20, 40, 60, 80, 100].map(n => `<span>${n}</span>`).join('');
-  openModal(`<h2 class="m-title">${esc(t.name)} · 评分</h2>
+  openModal(`<h2 class="m-title">${L('{0} · 评分', esc(t.name))}</h2>
     <div class="judges">${JUDGES.map((j, i) => `<div class="judge"><div class="av">${judgeAvatar(j, i)}</div><b>${j.name}</b><div class="sc" data-score="${scores[i]}">0.0</div><q>${[c1 + c1b, c2, c3][i]}</q></div>`).join('')}</div>
     <div class="score-big"><span id="totalN">0</span><small> / 100</small></div>
     <div class="tape" aria-hidden="true"><div class="fill" id="tapeFill"></div><div class="pin" id="tapePin"></div><div class="nums">${tick}</div></div>
     <div style="text-align:center"><span class="grade">${grade}</span></div>
     <div class="stars">${[0, 1, 2, 3, 4].map(i => `<span style="color:${i < stars ? '#ffc23a' : '#e5dcec'}" class="${i < stars ? 'on' : ''}">${ICO.star}</span>`).join('')}</div>
     ${tips.length ? `<div class="tips">${tips.join('<br>')}</div>` : ''}
-    <div class="m-actions"><button class="pill" data-close="1">继续调整</button><button class="pill" data-photo="1">拍照留念</button><button class="pill cherry" data-next="1" data-focus="1">下一题</button></div>`, c => {
+    <div class="m-actions"><button class="pill" data-close="1">${L('继续调整')}</button><button class="pill" data-photo="1">${L('拍照留念')}</button><button class="pill cherry" data-next="1" data-focus="1">${L('下一题')}</button></div>`, c => {
     requestAnimationFrame(() => {
       c.querySelector('#tapeFill').style.width = r.total + '%';
       c.querySelector('#tapePin').style.left = `calc(${r.total}% - 2px)`;
@@ -715,11 +717,11 @@ async function makePhoto(name) {
   try { if (document.fonts && document.fonts.ready) await document.fonts.ready; } catch (e) { /* ignore */ }
   c.fillStyle = '#3b2150'; c.textAlign = 'center';
   c.font = '64px "ZCOOL KuaiLe","PingFang SC","Microsoft YaHei",sans-serif';
-  c.fillText(name || '绒绒', cv.width / 2, PH + M + 92);
+  c.fillText(name || L('绒绒'), cv.width / 2, PH + M + 92);
   const d = new Date();
   c.font = '30px "ZCOOL KuaiLe","PingFang SC","Microsoft YaHei",sans-serif';
   c.fillStyle = '#8a7399';
-  const sub = (UI.challenge ? UI.challenge.name + '  ·  ' : '') + `绒绒时装屋  ${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')}`;
+  const sub = (UI.challenge ? UI.challenge.name + '  ·  ' : '') + `${L('绒绒时装屋')}  ${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')}`;
   c.fillText(sub, cv.width / 2, PH + M + 144);
   return cv.toDataURL('image/png');
 }
@@ -730,8 +732,8 @@ async function openPhoto() {
   document.body.appendChild(flash);
   requestAnimationFrame(() => requestAnimationFrame(() => { flash.style.opacity = 0; }));
   setTimeout(() => flash.remove(), 600);
-  openModal(`<h2 class="m-title">拍立得</h2><div class="name-in"><label for="nm">名字</label><input id="nm" maxlength="12" value="${esc(S.name || '')}"></div><div class="photo-wrap" id="pw"><p class="m-sub">冲洗中…</p></div>
-    <div class="m-actions"><button class="pill cherry" data-dl="1">${ICO.download.replace('<svg', '<svg width="18" height="18"')}保存图片</button></div><p class="hint">手机上也可以长按照片保存</p>`);
+  openModal(`<h2 class="m-title">${L('拍立得')}</h2><div class="name-in"><label for="nm">${L('名字')}</label><input id="nm" maxlength="12" value="${esc(S.name || '')}"></div><div class="photo-wrap" id="pw"><p class="m-sub">${L('冲洗中…')}</p></div>
+    <div class="m-actions"><button class="pill cherry" data-dl="1">${ICO.download.replace('<svg', '<svg width="18" height="18"')}${L('保存图片')}</button></div><p class="hint">${L('手机上也可以长按照片保存')}</p>`);
   await refreshPhoto();
 }
 let photoURL = '';
@@ -739,17 +741,17 @@ async function refreshPhoto() {
   const pw = $('#pw'); if (!pw) return;
   try {
     photoURL = await makePhoto(S.name);
-    pw.innerHTML = `<img alt="角色照片" src="${photoURL}">`;
+    pw.innerHTML = `<img alt="${L('角色照片')}" src="${photoURL}">`;
   } catch (e) {
-    pw.innerHTML = '<p class="m-sub">照片生成失败，换个浏览器再试试。</p>';
+    pw.innerHTML = '<p class="m-sub">' + L('照片生成失败，换个浏览器再试试。') + '</p>';
   }
 }
 function downloadPhoto() {
   if (!photoURL) return;
   const a = document.createElement('a');
-  a.href = photoURL; a.download = `绒绒时装屋-${S.name || 'photo'}.png`;
+  a.href = photoURL; a.download = `${L('绒绒时装屋')}-${S.name || 'photo'}.png`;
   document.body.appendChild(a); a.click(); a.remove();
-  toast('照片已保存');
+  toast(L('照片已保存'));
 }
 
 /* ---------- events ---------- */
@@ -829,9 +831,33 @@ function bind() {
 }
 
 /* ---------- boot ---------- */
+/* ---------- language ---------- */
+function localizeAll() {
+  for (const k in ITEMS) trDeep(ITEMS[k], ['name']);
+  trDeep(BASE_ITEMS, ['name']);
+  for (const k in SPECIES) { trField(SPECIES[k], 'name'); trDeep(SPECIES[k].pals, ['n']); }
+  for (const k in BODIES) trField(BODIES[k], 'name');
+  trDeep([SCENES, HAIRS, BACK_HAIRS, POSES, EXPRESSIONS, EYE_STYLES, PATTERNS, GROUPS, JUDGES], ['name']);
+  for (const k in CAT) trField(CAT[k], 'name');
+  trDeep(PRESETS, ['name', 'sub']);
+  trDeep(THEMES, ['name', 'desc']);
+  trValues(TAG_NAME);
+  trValues(DEFAULT_NAMES);
+  const zh = I18N_PACK.zh, keyOf = {};
+  for (const k in zh) keyOf[zh[k]] = k;
+  for (const sp in DEFAULT_NAMES) {
+    const z = ZH.get(DEFAULT_NAMES)[sp];
+    DEFAULT_NAME_FORMS.add(z); DEFAULT_NAME_FORMS.add(DEFAULT_NAMES[sp]);
+    for (const l of LANGS) { const t = I18N_PACK[l] && I18N_PACK[l][keyOf[z]]; if (t) DEFAULT_NAME_FORMS.add(t); }
+  }
+  if (DEFAULT_NAME_FORMS.has(S.name)) S.name = DEFAULT_NAMES[S.species] || S.name;
+}
+localizeAll();
+trPage();
 bind();
 renderGroups();
 refresh({});
+loadPlatformText(() => { localizeAll(); trPage(); renderGroups(); setChallengeUI(); refresh({}); });
 /*TRAILER_HOOK*/
 (() => {
   const c = $('#curtain');

@@ -7,9 +7,11 @@ fs.writeFileSync('dist/core.js', core + '\nif (typeof module !== "undefined") mo
 if (fs.existsSync('src/template.html')) {
   let html = fs.readFileSync('src/template.html', 'utf8');
   const css = fs.readFileSync('src/style.css', 'utf8');
-  const ui = ['music', 'ui'].filter(exist).map(f => fs.readFileSync(`src/${f}.js`, 'utf8')).join('\n');
+  const ui = ['music', 'lang', 'i18n', 'ui'].filter(exist).map(f => `/* ---- ${f}.js ---- */\n` + fs.readFileSync(`src/${f}.js`, 'utf8')).join('\n');
   html = html.replace('/*__CSS__*/', () => css).replace('/*__JS__*/', () => core + '\n' + ui);
   fs.writeFileSync('dist/game.html', html);
+  fs.writeFileSync('dist/绒绒时装屋.html', html);
+  fs.writeFileSync('index.html', html); // GitHub Pages
   console.log('game.html', (html.length / 1024).toFixed(1) + 'KB');
 }
 console.log('core.js', (core.length / 1024).toFixed(1) + 'KB');

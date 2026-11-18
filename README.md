@@ -9,10 +9,17 @@
 ## 构建
 
 ```sh
-node build.js        # src/ → dist/core.js 和 dist/game.html
-cp dist/game.html dist/绒绒时装屋.html
-cp dist/game.html index.html   # 在线试玩页（GitHub Pages）
+node tools/i18n.cjs  # 抽出中文 → i18n/zh.json，把 i18n/*.json 打包成 src/lang.js
+node build.js        # src/ → dist/core.js、dist/game.html、dist/绒绒时装屋.html 和 index.html（GitHub Pages）
 ```
+
+## 多语言
+
+中文、English、日本語、한국어、Español。打开时先看网址的 `?lang=`（AIWANNA 会带上），没有就看浏览器语言，都不匹配用英文。
+
+- 界面文字写中文原文，用 `L('换上了「{0}」', 名字)` 显示；数据表里的 `name` / `n` / `sub` / `desc` 在启动时整体换成当前语言（`src/i18n.js`，`ui.js` 的 `localizeAll`）。
+- 改了中文就跑 `node tools/i18n.cjs check`：新句子会列成缺翻译，补进 `i18n/en.json` 等文件（键是原文的短哈希，所有语言键名一致）。
+- 译文打包进游戏；作者在 AIWANNA 上改过的译文会在线覆盖（拉 `/i18n/<slug>/<lang>.json`，失败就用自带的）。
 
 角色全部由纯 JS 生成 SVG，没有图片素材。`src/` 里按部位分文件：身体和姿势（body.js）、各物种的头（toon.js、species.js）、五官（face.js）、背景音乐（music.js）、头发（hair.js，描图数据在 hair_data.js）、衣服鞋帽（wear_*.js）、场景（scenes.js）、界面（ui.js、style.css、template.html）。
 
